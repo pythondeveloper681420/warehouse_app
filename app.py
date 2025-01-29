@@ -452,7 +452,7 @@ class WarehouseApp:
                 [data-testid="collapsedControl"] {
                     display: none
                 }
-                .st-emotion-cache-w3nhqi {display: none}
+                .st-emotion-cache-hzo1qh  {display: none}
                 .stSidebar {display: none}
             </style>
         """, unsafe_allow_html=True)
