@@ -363,7 +363,8 @@ def obter_colunas_com_tipos(nome_colecao):
     
 def carregar_dados_paginados(nome_colecao, pagina, tamanho_pagina, filtros=None, colunas_tipos=None):
     """
-    Carrega dados paginados com suporte a filtros e ordenação
+    Carrega dados paginados com suporte a filtros e ordenação,
+    incluindo tratamento para limite de memória do MongoDB
     """
     if colunas_tipos is None:
         colunas_tipos = obter_colunas_com_tipos(nome_colecao)
@@ -377,15 +378,25 @@ def carregar_dados_paginados(nome_colecao, pagina, tamanho_pagina, filtros=None,
     
     try:
         # Definir ordenação padrão para a coleção XML
-        ordenacao = {}
+        ordenacao = None
         if nome_colecao == 'xml':
             ordenacao = [("Data Emissao", -1)]  # -1 para ordem decrescente, 1 para crescente
         
         total_filtrado = colecao.count_documents(consulta)
         
-        # Aplicar ordenação na consulta
+        # Configurar opções da consulta com allowDiskUse
+        opcoes_consulta = {
+            'allowDiskUse': True  # Permite uso de disco para operações de ordenação
+        }
+        
+        # Aplicar ordenação na consulta com as novas opções
         if ordenacao:
-            cursor = colecao.find(consulta).sort(ordenacao).skip(pular).limit(tamanho_pagina)
+            try:
+                cursor = colecao.find(consulta).sort(ordenacao).skip(pular).limit(tamanho_pagina)
+                cursor.with_options(**opcoes_consulta)
+            except Exception as sort_error:
+                #st.warning(f"Não foi possível ordenar por data: {sort_error}. Mostrando resultados sem ordenação.")
+                cursor = colecao.find(consulta).skip(pular).limit(tamanho_pagina)
         else:
             cursor = colecao.find(consulta).skip(pular).limit(tamanho_pagina)
         
@@ -395,6 +406,12 @@ def carregar_dados_paginados(nome_colecao, pagina, tamanho_pagina, filtros=None,
             df = pd.DataFrame(documentos)
             if '_id' in df.columns:
                 df = df.drop('_id', axis=1)
+                
+            # Verificar se as colunas existem antes de tentar acessá-las
+            colunas_existentes = df.columns.tolist()
+            if not colunas_existentes:
+                st.warning("Nenhuma coluna encontrada nos documentos retornados.")
+                return pd.DataFrame(), total_filtrado
         else:
             df = pd.DataFrame()
             
@@ -622,18 +639,107 @@ def exibir_pagina_dados(nome_colecao):
     else:
         st.warning("Nenhum dado encontrado com os filtros aplicados")
 
+def initialize_session_state():
+    """Initialize session state variables"""
+    if 'user' not in st.session_state:
+        st.session_state.user = {
+            st.switch_page("app.py")      
+        }
+
+
+
+
 def principal():
     st.set_page_config(
         page_title="Home",
         page_icon="📊",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="collapsed"       
     )
+    # Initialize session state
+    initialize_session_state()
 
+    with st.sidebar:    
+        # Get user info from session state
+        user = st.session_state.user
+        name = user.get('name',)
+        email = user.get('email', '')
+        phone = user.get('phone', '')
+        
+        # Create a container for user info with custom styling
+        st.markdown(
+            f"""
+            <div style='
+                padding: 1rem;
+                border-radius: 0.5rem;
+                background-color: #f0f2f6;
+                margin-bottom: 1rem;
+            '>
+                <div style='font-size: 1.1rem; font-weight: bold; margin-bottom: 0.5rem;                 display: flex;
+                justify-content: center;'>
+                    {name}
+                </div>
+                <div style='font-size: 0.9rem; color: #666;                display: flex;
+                justify-content: center;'>
+                     {email}  
+                </div>
+                <div style='font-size: 0.9rem; color: #666;                display: flex;
+                justify-content: center;'>
+                     {phone}  
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    # Enhanced initials display with gradient background
+        initials = st.session_state.user['initials']
+        st.markdown(
+            f"""
+            <div style='display: flex; justify-content: center; margin-bottom: 1.5rem;'>
+                <div style='
+                    display: flex;
+                    justify-content: center;
+                    background: linear-gradient(135deg, #0075be, #00a3e0);
+                    color: white;
+                    border-radius: 50%;
+                    width: 48px;
+                    height: 48px;
+                    align-items: center;
+                    font-size: 20px;
+                    font-weight: 600;
+                    box-shadow: 0 3px 6px rgba(0,0,0,0.16);
+                    transition: transform 0.2s ease;
+                    cursor: pointer;
+                ' onmouseover="this.style.transform='scale(1.05)'"
+                onmouseout="this.style.transform='scale(1)'">
+                    {initials}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        # Add the logout button
+        if st.button(
+            "Logout",
+            key="logout_button",
+            type="primary",
+            use_container_width=True
+        ):
+            # Limpar todos os estados da sessão
+            for key in st.session_state.keys():
+                del st.session_state[key]
+            
+            # Redirecionar para a página inicial
+            st.switch_page("app.py")
 
-    # Título h1 em negrito
-    st.markdown('## **📊 :rainbow[Home]**')
-    
-    colecoes = ['xml', 'nfspdf','po',]
+    col1, col2 = st.columns([3, 1], gap="large")
+
+    # Coluna 1
+    with col1:
+        st.markdown('## **📊 :rainbow[Home]**')
+
+    colecoes = ['xml', 'nfspdf', 'po']
     abas = st.tabs([colecao.upper() for colecao in colecoes])
     
     for aba, nome_colecao in zip(abas, colecoes):
