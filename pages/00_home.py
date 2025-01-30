@@ -221,32 +221,6 @@ def converter_documento_para_pandas(doc):
             documento_convertido[chave] = valor
     return documento_convertido
 
-
-def carregar_dados_paginados(nome_colecao, pagina, tamanho_pagina, filtros=None):
-    cliente = obter_cliente_mongodb()
-    banco_dados = cliente.warehouse
-    colecao = banco_dados[nome_colecao]
-    
-    consulta = construir_consulta_mongo(filtros) if filtros else {}
-    pular = (pagina - 1) * tamanho_pagina
-    
-    try:
-        total_filtrado = colecao.count_documents(consulta)
-        cursor = colecao.find(consulta).skip(pular).limit(tamanho_pagina)
-        documentos = [converter_documento_para_pandas(doc) for doc in cursor]
-        
-        if documentos:
-            df = pd.DataFrame(documentos)
-            if '_id' in df.columns:
-                df = df.drop('_id', axis=1)
-        else:
-            df = pd.DataFrame()
-            
-        return df, total_filtrado
-        
-    except Exception as e:
-        st.error(f"Erro ao carregar dados: {str(e)}")
-        return pd.DataFrame(), 0
 #obter_colunas_com_tipos
 def criar_interface_filtros(nome_colecao, colunas):
     """
