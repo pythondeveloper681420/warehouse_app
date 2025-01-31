@@ -7,491 +7,598 @@ import re
 import math
 import io
 from bson.objectid import ObjectId
+import streamlit.components.v1 as components
 
-def normalizar_string(texto):
-    if not isinstance(texto, str):
-        return str(texto)
-    
-    texto = texto.lower()
-    texto = ''.join(
-        char for char in unicodedata.normalize('NFKD', texto)
+def normalize_string(text):
+    if not isinstance(text, str):
+        return str(text)
+    text = text.lower()
+    text = ''.join(
+        char for char in unicodedata.normalize('NFKD', text)
         if unicodedata.category(char) != 'Mn'
     )
-    
-    texto = re.sub(r'[^\w\s]', '', texto)
-    
-    return texto
+    return re.sub(r'[^\w\s]', '', text)
 
-def criar_padrao_flexivel(texto):
-    texto_normalizado = normalizar_string(texto)
-    fragmentos = texto_normalizado.split()
-    
-    padrao = '.*'.join(
-        f'(?=.*{re.escape(fragmento)})' for fragmento in fragmentos
-    )
-    
-    return padrao + '.*'
+def create_flexible_pattern(text):
+    normalized = normalize_string(text)
+    fragments = normalized.split()
+    pattern = '.*'.join(f'(?=.*{re.escape(fragment)})' for fragment in fragments)
+    return pattern + '.*'
 
 @st.cache_resource
-def obter_cliente_mongodb():
-    nome_usuario = st.secrets["MONGO_USERNAME"]
-    senha = st.secrets["MONGO_PASSWORD"]
+def get_mongodb_client():
+    username = st.secrets["MONGO_USERNAME"]
+    password = st.secrets["MONGO_PASSWORD"]
     cluster = st.secrets["MONGO_CLUSTER"]
-    nome_banco_dados = st.secrets["MONGO_DB"]
+    database = st.secrets["MONGO_DB"]
     
-    nome_usuario_escapado = urllib.parse.quote_plus(nome_usuario)
-    senha_escapada = urllib.parse.quote_plus(senha)
-    URI_MONGO = f"mongodb+srv://{nome_usuario_escapado}:{senha_escapada}@{cluster}/{nome_banco_dados}?retryWrites=true&w=majority"
+    escaped_username = urllib.parse.quote_plus(username)
+    escaped_password = urllib.parse.quote_plus(password)
+    URI = f"mongodb+srv://{escaped_username}:{escaped_password}@{cluster}/{database}?retryWrites=true&w=majority"
     
-    return MongoClient(URI_MONGO)
+    return MongoClient(URI)
 
 @st.cache_data
-def obter_colunas_colecao(nome_colecao):
-    cliente = obter_cliente_mongodb()
-    banco_dados = cliente.warehouse
-    colecao = banco_dados[nome_colecao]
+def get_collection_columns(collection_name):
+    client = get_mongodb_client()
+    db = client.warehouse
+    collection = db[collection_name]
     
-    total_documentos = colecao.count_documents({})
-    documento_exemplo = colecao.find_one()
+    total_docs = collection.count_documents({})
+    sample_doc = collection.find_one()
     
-    colunas = []
-    if documento_exemplo:
-        colunas = [col for col in documento_exemplo.keys() if col != '_id']
+    columns = []
+    if sample_doc:
+        columns = [col for col in sample_doc.keys() if col != '_id']
     
-    colunas_padrao = {
-        'xml': [],
-        'po': [],
-        'nfspdf': []
+    default_columns = {
+        'xml': [
+            'url_imagens', 'Nota Fiscal', 'Item Nf', 'Nome Material',
+            'Codigo NCM', 'Quantidade', 'Unidade', 'Valor Unitario Produto',
+            'Valor Total Produto', 'Valor Total Nota Fiscal', 'Total itens Nf',
+            'data nf', 'Data Vencimento', 'Chave NF-e', 'Nome Emitente',
+            'CNPJ Emitente', 'CFOP Categoria', 'PO', 'Itens recebidos PO',
+            'Valor Recebido PO', 'Codigo Projeto', 'Projeto WBS Andritz',
+            'Centro de Custo', 'Codigo Projeto Envio', 'Projeto Envio',
+            'grupo', 'subgrupo'
+        ],
+        'nfspdf': ['Competencia', 'CNPJ Prestador'],
+        'po': ['Item', 'Supplier']
     }
     
-    return total_documentos, colunas, colunas_padrao.get(nome_colecao, colunas[:6])
+    fallback = default_columns.get(collection_name, columns[:27])
+    final_defaults = [col for col in fallback if col in columns]
+    
+    if not final_defaults:
+        final_defaults = columns[:10]
+    
+    return total_docs, columns, final_defaults
 
-@st.cache_data
-def obter_valores_unicos_do_banco_de_dados(nome_colecao, coluna):
-    cliente = obter_cliente_mongodb()
-    banco_dados = cliente.warehouse
-    colecao = banco_dados[nome_colecao]
+class CardManager:
+    def __init__(self, collection_name):
+        self.collection_name = collection_name
+        if 'edit_cards' not in st.session_state:
+            st.session_state.edit_cards = set()
+        if 'delete_cards' not in st.session_state:
+            st.session_state.delete_cards = set()
+
+    def get_collection(self):
+        client = get_mongodb_client()
+        return client.warehouse[self.collection_name]
+
+    def update_document(self, card_id, data):
+        try:
+            collection = self.get_collection()
+            collection.update_one(
+                {"_id": ObjectId(card_id)},
+                {"$set": data}
+            )
+            return True, "Record updated successfully!"
+        except Exception as e:
+            return False, f"Update error: {str(e)}"
+
+    def delete_document(self, card_id):
+        try:
+            collection = self.get_collection()
+            collection.delete_one({"_id": ObjectId(card_id)})
+            return True, "Record deleted successfully!"
+        except Exception as e:
+            return False, f"Delete error: {str(e)}"
+
+    def render_edit_modal(self, card_id, record, visible_cols, image_cols):
+        dialog_key = f"edit_dialog_{self.collection_name}_{card_id}"
+        
+        with st.container():
+            edited_data = {}
+            for col in visible_cols:
+                current_value = record.get(col, "")
+                
+                # Exibir _id como campo não editável
+                if col == '_id':
+                    st.text_input(
+                        "ID do Documento",
+                        value=current_value,
+                        key=f"edit_{self.collection_name}_{card_id}_{col}",
+                        disabled=True  # Campo desabilitado
+                    )
+                    continue  # Pula para próxima coluna
+                
+                # Campos normais (editáveis)
+                edited_data[col] = st.text_input(
+                    col,
+                    current_value,
+                    key=f"edit_{self.collection_name}_{card_id}_{col}"
+                )
+            
+            # Botões de ação (mantidos)
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Salvar", type="primary", key=f"save_{self.collection_name}_{card_id}"):
+                    success, message = self.update_document(card_id, edited_data)
+                    if success:
+                        st.success(message)
+                        st.session_state.edit_cards.remove(card_id)
+                        st.rerun()
+                    else:
+                        st.error(message)
+            with col2:
+                if st.button("Cancelar", key=f"cancel_edit_{self.collection_name}_{card_id}"):
+                    st.session_state.edit_cards.remove(card_id)
+                    st.rerun()
+
+    def render_delete_modal(self, card_id):
+        dialog_key = f"delete_dialog_{self.collection_name}_{card_id}"
+        
+        # Create a placeholder for the dialog
+        dialog = st.container()
+        
+        with dialog:
+            st.warning("Are you sure you want to delete this record?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button(
+                    "Yes, Delete",
+                    type="primary",
+                    key=f"confirm_delete_{self.collection_name}_{card_id}"
+                ):
+                    success, message = self.delete_document(card_id)
+                    if success:
+                        st.success(message)
+                        st.session_state.delete_cards.remove(card_id)
+                        st.rerun()
+                    else:
+                        st.error(message)
+            with col2:
+                if st.button(
+                    "Cancel",
+                    key=f"cancel_delete_{self.collection_name}_{card_id}"
+                ):
+                    st.session_state.delete_cards.remove(card_id)
+                    st.rerun()
+
+def get_unique_values(collection_name, column):
+    client = get_mongodb_client()
+    collection = client.warehouse[collection_name]
     
     pipeline = [
-        {"$group": {"_id": f"${coluna}"}},
+        {"$group": {"_id": f"${column}"}},
         {"$sort": {"_id": 1}},
         {"$limit": 100000}
     ]
     
     try:
-        valores_unicos = [doc["_id"] for doc in colecao.aggregate(pipeline) if doc["_id"] is not None]
-        return sorted(valores_unicos)
+        unique_values = [
+            doc["_id"] for doc in collection.aggregate(pipeline)
+            if doc["_id"] is not None
+        ]
+        return sorted(unique_values)
     except Exception as e:
-        st.error(f"Erro ao obter valores únicos para {coluna}: {str(e)}")
+        st.error(f"Error getting unique values for {column}: {str(e)}")
         return []
 
-def converter_para_numerico(valor):
-    valor_limpo = str(valor).strip().replace(',', '.')
-    
+def convert_to_numeric(value):
+    clean_value = str(value).strip().replace(',', '.')
     try:
-        return int(valor_limpo)
+        return int(clean_value)
     except ValueError:
         try:
-            return float(valor_limpo)
+            return float(clean_value)
         except ValueError:
-            return valor
+            return value
 
-def obter_colunas_com_tipos(nome_colecao):
+def get_column_types(collection_name):
     try:
-        cliente = obter_cliente_mongodb()
-        banco_dados = cliente.warehouse
-        colecao = banco_dados[nome_colecao]
+        client = get_mongodb_client()
+        collection = client.warehouse[collection_name]
+        sample_doc = collection.find_one()
         
-        documento_exemplo = colecao.find_one()
-        
-        if not documento_exemplo:
-            st.warning(f"Nenhum documento encontrado na coleção {nome_colecao}")
+        if not sample_doc:
+            st.warning(f"No documents found in collection {collection_name}")
             return {}
         
-        def determinar_tipo(valor):
-            if valor is None:
+        def determine_type(value):
+            if value is None:
                 return 'str'
-            if isinstance(valor, int):
+            if isinstance(value, int):
                 return 'int64'
-            elif isinstance(valor, float):
+            elif isinstance(value, float):
                 return 'float64'
-            elif isinstance(valor, str):
+            elif isinstance(value, str):
                 try:
-                    int(valor.replace(',', ''))
+                    int(value.replace(',', ''))
                     return 'int64'
                 except ValueError:
                     try:
-                        float(valor.replace(',', '.'))
+                        float(value.replace(',', '.'))
                         return 'float64'
                     except ValueError:
                         return 'str'
             return 'str'
         
-        tipos_colunas = {}
-        for chave, valor in documento_exemplo.items():
-            if chave != '_id':
-                tipos_colunas[chave] = determinar_tipo(valor)
-        
-        return tipos_colunas
-    
+        return {k: determine_type(v) for k, v in sample_doc.items() if k != '_id'}
     except Exception as e:
-        st.error(f"Erro ao obter tipos de colunas: {str(e)}")
+        st.error(f"Error getting column types: {str(e)}")
         return {}
 
-def construir_consulta_mongo(filtros, colunas_tipos):
-    consulta = {}
+def build_mongo_query(filters, column_types):
+    query = {}
     
-    for coluna, info_filtro in filtros.items():
-        tipo_filtro = info_filtro['type']
-        valor_filtro = info_filtro['value']
+    for column, filter_info in filters.items():
+        filter_type = filter_info['type']
+        filter_value = filter_info['value']
         
-        if not valor_filtro:
+        if not filter_value:
             continue
         
-        if colunas_tipos.get(coluna, 'str') in ['int64', 'float64']:
+        if column_types.get(column, 'str') in ['int64', 'float64']:
             try:
-                valor_numerico = converter_para_numerico(valor_filtro)
-                
-                if isinstance(valor_numerico, (int, float)):
-                    consulta[coluna] = valor_numerico
+                numeric_value = convert_to_numeric(filter_value)
+                if isinstance(numeric_value, (int, float)):
+                    query[column] = numeric_value
                     continue
             except:
                 pass
         
-        if tipo_filtro == 'text':
-            padrao_flexivel = criar_padrao_flexivel(valor_filtro)
-            
-            consulta[coluna] = {
-                '$regex': padrao_flexivel, 
-                '$options': 'i'
-            }
-        elif tipo_filtro == 'multi':
-            if len(valor_filtro) > 0:
-                consulta[coluna] = {'$in': valor_filtro}
+        if filter_type == 'text':
+            pattern = create_flexible_pattern(filter_value)
+            query[column] = {'$regex': pattern, '$options': 'i'}
+        elif filter_type == 'multi':
+            if filter_value:
+                query[column] = {'$in': filter_value}
     
-    return consulta
+    return query
 
-def converter_documento_para_pandas(doc):
-    documento_convertido = {}
-    for chave, valor in doc.items():
-        if isinstance(valor, ObjectId):
-            documento_convertido[chave] = str(valor)
-        elif isinstance(valor, dict):
-            documento_convertido[chave] = converter_documento_para_pandas(valor)
-        elif isinstance(valor, list):
-            documento_convertido[chave] = [str(item) if isinstance(item, ObjectId) else item for item in valor]
-        else:
-            documento_convertido[chave] = valor
-    return documento_convertido
-
-def criar_interface_filtros(nome_colecao, colunas):
-    colunas_tipos = obter_colunas_com_tipos(nome_colecao) or {}
+def create_filter_interface(collection_name, columns):
+    column_types = get_column_types(collection_name)
+    filters = {}
     
-    filtros = {}
-    texto = ('**Filtros:**')   
-    
-    with st.expander(label=texto, expanded=False):
-        colunas_selecionadas = st.multiselect(
-            "Selecione as colunas para filtrar:",
-            colunas,
-            key=f"filter_cols_{nome_colecao}"
+    with st.expander("**Filters:**", expanded=False):
+        selected_columns = st.multiselect(
+            "Select columns to filter:",
+            columns,
+            key=f"filter_cols_{collection_name}"
         )
         
-        if colunas_selecionadas:
+        if selected_columns:
             cols = st.columns(2)
-            
-            for idx, coluna in enumerate(colunas_selecionadas):
+            for idx, column in enumerate(selected_columns):
                 with cols[idx % 2]:
-                    st.markdown(f"#### {coluna}")
-                    
-                    tipo_coluna = colunas_tipos.get(coluna, 'str')
-                    
-                    tipo_filtro = st.radio(
-                        "Tipo de filtro:",
-                        ["Texto", "Seleção Múltipla"],
-                        key=f"radio_{nome_colecao}_{coluna}",
+                    st.markdown(f"#### {column}")
+                    column_type = column_types.get(column, 'str')
+                    filter_type = st.radio(
+                        "Filter type:",
+                        ["Text", "Multiple Selection"],
+                        key=f"radio_{collection_name}_{column}",
                         horizontal=True
                     )
                     
-                    if tipo_filtro == "Texto":
-                        valor = st.text_input(
-                            f"Buscar {coluna}" + (" (numérico)" if tipo_coluna in ['int64', 'float64'] else ""),
-                            key=f"text_filter_{nome_colecao}_{coluna}"
+                    if filter_type == "Text":
+                        value = st.text_input(
+                            f"Search {column}" + (" (numeric)" if column_type in ['int64', 'float64'] else ""),
+                            key=f"text_filter_{collection_name}_{column}"
                         )
-                        if valor:
-                            filtros[coluna] = {'type': 'text', 'value': valor}
+                        if value:
+                            filters[column] = {'type': 'text', 'value': value}
                     else:
-                        valores_unicos = obter_valores_unicos_do_banco_de_dados(nome_colecao, coluna)
-                        if valores_unicos:
-                            selecionados = st.multiselect(
-                                "Selecione os valores:",
-                                options=valores_unicos,
-                                key=f"multi_filter_{nome_colecao}_{coluna}",
-                                help="Selecione um ou mais valores para filtrar"
+                        unique_values = get_unique_values(collection_name, column)
+                        if unique_values:
+                            selected = st.multiselect(
+                                "Select values:",
+                                options=unique_values,
+                                key=f"multi_filter_{collection_name}_{column}"
                             )
-                            if selecionados:
-                                filtros[coluna] = {'type': 'multi', 'value': selecionados}
+                            if selected:
+                                filters[column] = {'type': 'multi', 'value': selected}
                     
                     st.markdown("---")
     
-    return filtros, colunas_tipos
+    return filters, column_types
 
-def carregar_dados_paginados(nome_colecao, pagina, tamanho_pagina, filtros=None, colunas_tipos=None):
-    if colunas_tipos is None:
-        colunas_tipos = obter_colunas_com_tipos(nome_colecao)
+def convert_for_pandas(doc):
+    converted = {}
+    for key, value in doc.items():
+        if isinstance(value, ObjectId):
+            converted[key] = str(value)
+        elif isinstance(value, dict):
+            converted[key] = convert_for_pandas(value)
+        elif isinstance(value, list):
+            converted[key] = [str(item) if isinstance(item, ObjectId) else item for item in value]
+        else:
+            converted[key] = value
+    return converted
+
+def load_paginated_data(collection_name, page, page_size, filters=None, column_types=None):
+    if column_types is None:
+        column_types = get_column_types(collection_name)
     
-    cliente = obter_cliente_mongodb()
-    banco_dados = cliente.warehouse
-    colecao = banco_dados[nome_colecao]
-    
-    consulta = construir_consulta_mongo(filtros, colunas_tipos) if filtros else {}
-    pular = (pagina - 1) * tamanho_pagina
+    client = get_mongodb_client()
+    collection = client.warehouse[collection_name]
+    query = build_mongo_query(filters, column_types) if filters else {}
+    skip = (page - 1) * page_size
     
     try:
-        ordenacao = [("Data Emissao", -1)] if nome_colecao == 'xml' else None
+        sorting = [("Data Emissao", -1)] if collection_name == 'xml' else None
+        total_filtered = collection.count_documents(query)
         
-        total_filtrado = colecao.count_documents(consulta)
-        
-        opcoes_consulta = {'allowDiskUse': True}
-        
-        if ordenacao:
+        if sorting:
             try:
-                cursor = colecao.find(consulta).sort(ordenacao).skip(pular).limit(tamanho_pagina)
-                cursor.with_options(**opcoes_consulta)
-            except Exception as sort_error:
-                cursor = colecao.find(consulta).skip(pular).limit(tamanho_pagina)
+                cursor = collection.find(query).sort(sorting).skip(skip).limit(page_size)
+            except Exception:
+                cursor = collection.find(query).skip(skip).limit(page_size)
         else:
-            cursor = colecao.find(consulta).skip(pular).limit(tamanho_pagina)
+            cursor = collection.find(query).skip(skip).limit(page_size)
         
-        documentos = [converter_documento_para_pandas(doc) for doc in cursor]
-        
-        if documentos:
-            df = pd.DataFrame(documentos)
-            if '_id' in df.columns:
-                df = df.drop('_id', axis=1)
-        else:
-            df = pd.DataFrame()
+        documents = [convert_for_pandas(doc) for doc in cursor]
+        df = pd.DataFrame(documents)
+
             
-        return df, total_filtrado
-        
+        return df, total_filtered
     except Exception as e:
-        st.error(f"Erro ao carregar dados: {str(e)}")
+        st.error(f"Error loading data: {str(e)}")
         return pd.DataFrame(), 0
 
-def renderizar_cards(df, colunas_visiveis):
-    def processar_urls(urls):
-        if pd.isna(urls):
-            return None
-        
-        if isinstance(urls, str):
-            urls = [urls]
-        elif not isinstance(urls, list):
-            return None
-        
-        urls_validas = [url for url in urls if url and isinstance(url, str)]
-        return urls_validas[0] if urls_validas else None
+def process_urls(urls):
+    if isinstance(urls, pd.Series):
+        urls = urls.iloc[0]
+    if urls is None or (isinstance(urls, float) and math.isnan(urls)):
+        return None
+    if isinstance(urls, str):
+        return urls
+    if isinstance(urls, list):
+        valid_urls = [url for url in urls if url and isinstance(url, str)]
+        return valid_urls[0] if valid_urls else None
+    return None
 
-    def formatar_valor(valor):
-        if pd.isna(valor):
-            return '-'
-        
-        if isinstance(valor, (int, float)):
-            if float(valor).is_integer():
-                return f'{int(valor):,}'.replace(',', '')
-            return f'{valor:.2f}'.replace('.', ',')
-        
-        if isinstance(valor, str):
-            valor_limpo = valor.strip().replace(',', '.')
-            try:
-                num_valor = float(valor_limpo)
-                if float(num_valor).is_integer():
-                    return f'{int(num_valor):,}'.replace(',', '')
-                return f'{num_valor:.2f}'.replace('.', ',')
-            except ValueError:
-                return str(valor)[:30]
-        
-        return str(valor)[:30]
+def format_value(value):
+    if isinstance(value, pd.Series):
+        value = value.iloc[0]
+    if pd.isna(value):
+        return '-'
+    if isinstance(value, (int, float)):
+        if float(value).is_integer():
+            return f'{int(value):,}'.replace(',', '')
+        return f'{value:.2f}'.replace('.', ',')
+    if isinstance(value, str):
+        clean_value = value.strip().replace(',', '.')
+        try:
+            num_value = float(clean_value)
+            if float(num_value).is_integer():
+                return f'{int(num_value):,}'.replace(',', '')
+            return f'{num_value:.2f}'.replace('.', ',')
+        except ValueError:
+            return str(value)[:35]
+    return str(value)[:35]
 
-    colunas_imagens = [col for col in df.columns if 'url_imagens' in col.lower()]
-    num_colunas = 4
-    linhas = [df.iloc[i:i+num_colunas] for i in range(0, len(df), num_colunas)]
+def render_cards(df, visible_columns, collection_name):
+    manager = CardManager(collection_name)
+    image_columns = [col for col in df.columns if 'url_imagens' in col.lower()]
+    num_columns = 5
+    rows = [df.iloc[i:i+num_columns] for i in range(0, len(df), num_columns)]
     
-    for linha in linhas:
-        cols = st.columns(num_colunas)
+    for row_idx, row in enumerate(rows):
+        cols = st.columns(num_columns)
         
-        for idx, (_, registro) in enumerate(linha.iterrows()):
-            with cols[idx]:
-                url_imagem = None
-                for col_img in colunas_imagens:
-                    url_imagem = processar_urls(registro.get(col_img))
-                    if url_imagem:
-                        break
+        for col_idx, (_, record) in enumerate(row.iterrows()):
+            with cols[col_idx]:
+                image_url = None
+                for img_col in image_columns:
+                    if img_col in record:
+                        image_url = process_urls(record[img_col])
+                        if image_url:
+                            break
                 
-                detalhes_card = ''.join([
-                    f'<div style="margin-bottom: 4px; font-size: 0.75rem;"><strong>{col}:</strong> {formatar_valor(registro.get(col, "-"))}' 
-                    for col in colunas_visiveis if col not in colunas_imagens
+                # Conteúdo do Card
+                card_details = ''.join([
+                    f'<div style="margin-bottom: 4px; font-size: 0.8rem;">'
+                    f'<strong>{col}:</strong> {format_value(record.get(col, "-"))}</div>'
+                    for col in visible_columns 
+                    if col not in image_columns and col != '_id'
                 ])
                 
                 card_style = (
                     "border: 1px solid #e0e0e0; border-radius: 8px; "
                     "box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 10px; "
-                    "overflow: hidden; transition: transform 0.2s;"
+                    "overflow: hidden; transition: transform 0.2s; "
+                    "height: 400px;"
                 )
                 
-                if url_imagem:
+                if image_url:
                     card_html = f"""
-                    <div style='{card_style}' onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
-                        <img src="{url_imagem}" style="width:100%; height:200px; object-fit:cover;">
-                        <div style='padding: 8px; font-size: 0.8rem;'>
-                            {detalhes_card}
+                    <div style='{card_style}'>
+                        <div style="width:100%; height:180px; display:flex; justify-content:center; align-items:center; overflow:hidden;">
+                            <img src="{image_url}" style="width:100%; height:100%; object-fit:contain; object-position:center;">
+                        </div>
+                        <div style='padding: 8px; font-size: 0.8rem; height: 180px; overflow-y: auto;'>
+                            {card_details}
                         </div>
                     </div>
                     """
                 else:
                     card_html = f"""
-                    <div style='{card_style}' onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
-                        <div style='padding: 8px; font-size: 0.8rem;'>
-                            {detalhes_card}
+                    <div style='{card_style}'>
+                        <div style='padding: 8px; font-size: 0.8rem; height: 360px; overflow-y: auto;'>
+                            {card_details}
                         </div>
                     </div>
                     """
                 
                 st.markdown(card_html, unsafe_allow_html=True)
+                
+                # Botões ABAIXO do card
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button(
+                        "✏️ Edit",
+                        key=f"edit_btn_{collection_name}_{record['_id']}",
+                        use_container_width=True
+                    ):
+                        st.session_state.edit_cards.add(str(record['_id']))
+                with col2:
+                    if st.button(
+                        "🗑️ Delete",
+                        key=f"delete_btn_{collection_name}_{record['_id']}",
+                        use_container_width=True
+                    ):
+                        st.session_state.delete_cards.add(str(record['_id']))
+                
+                # Modais
+                card_id = str(record['_id'])
+                if card_id in st.session_state.edit_cards:
+                    manager.render_edit_modal(card_id, record, visible_columns + ['_id'], image_columns)
+                if card_id in st.session_state.delete_cards:
+                    manager.render_delete_modal(card_id)
 
-def exibir_pagina_dados(nome_colecao):
-    total_documentos, colunas, colunas_visiveis_padrao = obter_colunas_colecao(nome_colecao)
+def display_data_page(collection_name):
+    total_documents, columns, default_visible = get_collection_columns(collection_name)
     
-    if total_documentos == 0:
-        st.error(f"Nenhum documento encontrado na coleção {nome_colecao}")
+    # Adicionar estas 2 linhas ↓
+    columns = [col for col in columns if col != '_id']
+    default_visible = [col for col in default_visible if col != '_id']
+    
+    if total_documents == 0:
+        st.error(f"No documents found in collection {collection_name}")
         return
 
-    with st.expander("**Colunas Visíveis:**", expanded=False):
-        if f'colunas_visiveis_{nome_colecao}' not in st.session_state:
-            colunas_imagens = [col for col in colunas if 'url_imagens' in col.lower()]
-            outras_colunas = [col for col in colunas if 'url_imagens' not in col.lower()]
-            st.session_state[f'colunas_visiveis_{nome_colecao}'] = (
-                colunas_imagens + 
-                [col for col in colunas_visiveis_padrao if col not in colunas_imagens] + 
-                outras_colunas
-            )[:10]
+    with st.expander("**Visible Columns:**", expanded=False):
+        state_key = f'visible_columns_{collection_name}'
+        if state_key not in st.session_state:
+            st.session_state[state_key] = default_visible
             
-        colunas_visiveis = st.multiselect(
-            "Selecione as colunas para exibir:",
-            options=colunas,
-            default=st.session_state[f'colunas_visiveis_{nome_colecao}'],
-            key=f'seletor_colunas_{nome_colecao}'
+        visible_columns = st.multiselect(
+            "Select columns to display:",
+            options=columns,
+            default=st.session_state[state_key],
+            key=f'column_selector_{collection_name}'
         )
-        st.session_state[f'colunas_visiveis_{nome_colecao}'] = colunas_visiveis
+        st.session_state[state_key] = visible_columns
         
-        if st.button("Restaurar Colunas Padrão", key=f"restaurar_colunas_{nome_colecao}"):
-            st.session_state[f'colunas_visiveis_{nome_colecao}'] = (
-                [col for col in colunas if 'url_imagens' in col.lower()] + 
-                colunas_visiveis_padrao
-            )[:10]
+        if st.button("Show All Columns", key=f"show_all_{collection_name}"):
+            st.session_state[state_key] = columns
             st.rerun()
+
+    filters, column_types = create_filter_interface(collection_name, columns)
     
-    filtros, colunas_tipos = criar_interface_filtros(nome_colecao, colunas)
-    
-    with st.expander("**Configurações:**", expanded=False):
+    with st.expander("**Settings:**", expanded=False):
         col1, col2, col3 = st.columns([1,1,1], gap='small')
         
         with col1:
             c1, c2 = st.columns([2, 1])
-            c1.write('Registros por página:')
-            tamanho_pagina = c2.selectbox(
-                "Registros por página:",
-                options=[10, 25, 50, 100, 1000],
+            c1.write('Records per page:')
+            page_size = c2.selectbox(
+                "Records per page:",
+                options=[10, 25, 50, 100],
                 index=1,
-                key=f"tamanho_pagina_{nome_colecao}",
+                key=f"page_size_{collection_name}",
                 label_visibility='collapsed'
             )
         
-        if f'pagina_{nome_colecao}' not in st.session_state:
-            st.session_state[f'pagina_{nome_colecao}'] = 1
-        pagina_atual = st.session_state[f'pagina_{nome_colecao}']
+        page_key = f'page_{collection_name}'
+        if page_key not in st.session_state:
+            st.session_state[page_key] = 1
+        current_page = st.session_state[page_key]
         
-        df, total_filtrado = carregar_dados_paginados(
-            nome_colecao, 
-            pagina_atual, 
-            tamanho_pagina, 
-            filtros, 
-            colunas_tipos
+        df, total_filtered = load_paginated_data(
+            collection_name,
+            current_page,
+            page_size,
+            filters,
+            column_types
         )
         
-        if not df.empty and colunas_visiveis:
-            df = df[colunas_visiveis]
+        if not df.empty and visible_columns:
+             df = df[visible_columns + ['_id']]  # ✅ Adicione esta linha
         
-        total_paginas = math.ceil(total_filtrado / tamanho_pagina) if total_filtrado > 0 else 1
-        pagina_atual = min(pagina_atual, total_paginas)
+        total_pages = math.ceil(total_filtered / page_size) if total_filtered > 0 else 1
+        current_page = min(current_page, total_pages)
         
         with col2:
-            st.write(f"Total: {total_filtrado} registros | Página {pagina_atual} de {total_paginas}")
+            st.write(f"Total: {total_filtered} records | Page {current_page} of {total_pages}")
         
         with col3:
             cols = st.columns(4)
-            navegacao_callbacks = {
-                "⏪": lambda: st.session_state.update({f'pagina_{nome_colecao}': 1}),
-                "◀️": lambda: st.session_state.update({f'pagina_{nome_colecao}': max(1, pagina_atual - 1)}),
-                "▶️": lambda: st.session_state.update({f'pagina_{nome_colecao}': min(total_paginas, pagina_atual + 1)}),
-                "⏩": lambda: st.session_state.update({f'pagina_{nome_colecao}': total_paginas})
+            navigation = {
+                "⏪": lambda: st.session_state.update({page_key: 1}),
+                "◀️": lambda: st.session_state.update({page_key: max(1, current_page - 1)}),
+                "▶️": lambda: st.session_state.update({page_key: min(total_pages, current_page + 1)}),
+                "⏩": lambda: st.session_state.update({page_key: total_pages})
             }
             
-            for idx, (texto, callback) in enumerate(navegacao_callbacks.items()):
-                if cols[idx].button(texto, key=f"{texto}_{nome_colecao}"):
+            for idx, (text, callback) in enumerate(navigation.items()):
+                if cols[idx].button(text, key=f"{text}_{collection_name}"):
                     callback()
                     st.rerun()
 
     if not df.empty:
-        renderizar_cards(df, colunas_visiveis)
+        render_cards(df, visible_columns, collection_name)
         
-        if st.button("📥 Baixar dados filtrados", key=f"download_{nome_colecao}"):
-            texto_progresso = "Preparando download..."
-            barra_progresso = st.progress(0, text=texto_progresso)
+        if st.button("📥 Download filtered data", key=f"download_{collection_name}"):
+            progress_text = "Preparing download..."
+            progress_bar = st.progress(0, text=progress_text)
             
-            todos_dados = []
-            tamanho_lote = 1000
-            total_paginas_download = math.ceil(total_filtrado / tamanho_lote)
+            all_data = []
+            batch_size = 1000
+            total_download_pages = math.ceil(total_filtered / batch_size)
             
-            for pagina in range(1, total_paginas_download + 1):
-                progresso = pagina / total_paginas_download
-                barra_progresso.progress(progresso, text=f"{texto_progresso} ({pagina}/{total_paginas_download})")
+            for page in range(1, total_download_pages + 1):
+                progress = page / total_download_pages
+                progress_bar.progress(progress, text=f"{progress_text} ({page}/{total_download_pages})")
                 
-                df_pagina, _ = carregar_dados_paginados(nome_colecao, pagina, tamanho_lote, filtros)
-                if colunas_visiveis:
-                    df_pagina = df_pagina[colunas_visiveis]
-                todos_dados.append(df_pagina)
+                page_df, _ = load_paginated_data(collection_name, page, batch_size, filters)
+                if visible_columns:
+                    page_df = page_df[visible_columns]
+                all_data.append(page_df)
             
-            df_completo = pd.concat(todos_dados, ignore_index=True)
+            complete_df = pd.concat(all_data, ignore_index=True)
             
             buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as escritor:
-                df_completo.to_excel(escritor, index=False, sheet_name='Dados')
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                complete_df.to_excel(writer, index=False, sheet_name='Data')
             
             st.download_button(
-                label="💾 Clique para baixar Excel",
+                label="💾 Click to download Excel",
                 data=buffer.getvalue(),
-                file_name=f'{nome_colecao}_dados.xlsx',
+                file_name=f'{collection_name}_data.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
             
-            barra_progresso.empty()
+            progress_bar.empty()
     else:
-        st.warning("Nenhum dado encontrado com os filtros aplicados")
+        st.warning("No data found with applied filters")
 
 def initialize_session_state():
     if 'user' not in st.session_state:
         st.switch_page("app.py")
 
-def principal():
+def main():
     st.set_page_config(
         page_title="Home",
         page_icon="📊",
         layout="wide",
-        initial_sidebar_state="collapsed"       
+        initial_sidebar_state="collapsed"
     )
     initialize_session_state()
 
-    with st.sidebar:    
+    with st.sidebar:
         user = st.session_state.user
         name = user.get('name')
         email = user.get('email', '')
@@ -506,29 +613,29 @@ def principal():
                 margin-bottom: 1rem;
             '>
                 <div style='
-                    font-size: 1.1rem; 
-                    font-weight: bold; 
-                    margin-bottom: 0.5rem;                 
+                    font-size: 1.1rem;
+                    font-weight: bold;
+                    margin-bottom: 0.5rem;
                     display: flex;
                     justify-content: center;
                 '>
                     {name}
                 </div>
                 <div style='
-                    font-size: 0.9rem; 
-                    color: #666;                
+                    font-size: 0.9rem;
+                    color: #666;
                     display: flex;
                     justify-content: center;
                 '>
-                     {email}  
+                    {email}
                 </div>
                 <div style='
-                    font-size: 0.9rem; 
-                    color: #666;                
+                    font-size: 0.9rem;
+                    color: #666;
                     display: flex;
                     justify-content: center;
                 '>
-                     {phone}  
+                    {phone}
                 </div>
             </div>
             """,
@@ -570,23 +677,21 @@ def principal():
         ):
             for key in st.session_state.keys():
                 del st.session_state[key]
-            
             st.switch_page("app.py")
 
     col1, col2 = st.columns([3, 1], gap="large")
-
     with col1:
         st.markdown('## **📊 :rainbow[Home]**')
 
-    colecoes = ['xml', 'nfspdf', 'po']
-    abas = st.tabs([colecao.upper() for colecao in colecoes])
+    collections = ['xml', 'nfspdf', 'po']
+    tabs = st.tabs([collection.upper() for collection in collections])
     
-    for aba, nome_colecao in zip(abas, colecoes):
-        with aba:
-            exibir_pagina_dados(nome_colecao)
+    for tab, collection_name in zip(tabs, collections):
+        with tab:
+            display_data_page(collection_name)
     
     st.divider()
-    st.caption("Dashboard de Dados MongoDB v1.0")
+    st.caption("MongoDB Data Dashboard v1.0")
 
 if __name__ == "__main__":
-    principal()
+    main()
