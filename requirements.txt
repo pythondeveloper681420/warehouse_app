@@ -9,6 +9,7 @@ click==8.1.8
 colorama==0.4.6
 cryptography==44.0.0
 dnspython==2.7.0
+et_xmlfile==2.0.0
 gitdb==4.0.12
 GitPython==3.1.44
 idna==3.10
@@ -20,6 +21,7 @@ MarkupSafe==3.0.2
 mdurl==0.1.2
 narwhals==1.24.1
 numpy==2.2.2
+openpyxl==3.1.5
 packaging==24.2
 pandas==2.2.3
 pdfminer.six==20231228
@@ -53,3 +55,4 @@ typing_extensions==4.12.2
 tzdata==2025.1
 urllib3==2.3.0
 watchdog==6.0.0
+XlsxWriter==3.2.1
