@@ -46,7 +46,7 @@ class Config:
     SENDER_NAME = "Sistema Warehouse"
     SENDER_EMAIL = "daniel.albuquerque@andritz.com"
     DEV_URL = "http://localhost:8501"
-    PROD_URL = "https://warehouseapp-app.streamlit.app/"
+    PROD_URL = "https://warehouse-app.streamlit.app/"
     AUTH_TOKEN_EXPIRY_HOURS = 24  # Authentication token expiry (1 day)
     VALIDATION_TOKEN_EXPIRY_HOURS = 24 * 7  # Email validation token expiry (7 days)
     MIN_PASSWORD_LENGTH = 6
