@@ -16,7 +16,7 @@ import urllib.parse
 from bson.objectid import ObjectId
 
 ####
-
+#tags
 # Função para converter ObjectId para strings
 def convert_objectid_to_str(documents):
     for document in documents:
@@ -583,7 +583,7 @@ def main():
             df.drop_duplicates(subset='unique', inplace=True)
 
             df['tags'] = df['Descrição'].astype(str)
-            df['tags'] = df['tags'].apply(tag)
+            df['tags'] = df['tags'].apply(tag).str.rstrip()  # Remove espaços no final
             
             # df=df_formatted
             def convert_to_decimal(df, columns, decimal_places=2):

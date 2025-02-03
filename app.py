@@ -46,8 +46,9 @@ class Config:
     SENDER_NAME = "Sistema Warehouse"
     SENDER_EMAIL = "daniel.albuquerque@andritz.com"
     DEV_URL = "http://localhost:8501"
-    PROD_URL = "https://warehouse-app.streamlit.app/"
-    TOKEN_EXPIRY_HOURS = 24 * 7
+    PROD_URL = "https://warehouseapp-app.streamlit.app/"
+    AUTH_TOKEN_EXPIRY_HOURS = 24  # Authentication token expiry (1 day)
+    VALIDATION_TOKEN_EXPIRY_HOURS = 24 * 7  # Email validation token expiry (7 days)
     MIN_PASSWORD_LENGTH = 6
     ALLOWED_EMAIL_DOMAIN = "@andritz.com"
 
@@ -81,20 +82,32 @@ class Database:
             self.users.insert_one(user_data)
             return True
         except Exception as e:
-            st.error(f"Error creating user: {e}")
+            st.error(f"Erro ao criar usuário: {e}")
             return False
 
     def create_token(self, token_data: Dict) -> bool:
         try:
-            token_data['created_at'] = Config.get_current_utc_time()
+            current_time = Config.get_current_utc_time()
+            expiry_hours = (Config.AUTH_TOKEN_EXPIRY_HOURS 
+                          if token_data.get('type') == 'auth' 
+                          else Config.VALIDATION_TOKEN_EXPIRY_HOURS)
+            
+            token_data.update({
+                'created_at': current_time,
+                'expires_at': current_time + timedelta(hours=expiry_hours)
+            })
             self.tokens.insert_one(token_data)
             return True
         except Exception as e:
-            st.error(f"Error creating token: {e}")
+            st.error(f"Erro ao criar token: {e}")
             return False
 
-    def find_token(self, token: str) -> Optional[Dict]:
-        return self.tokens.find_one({"token": token})
+    def find_valid_token(self, token: str) -> Optional[Dict]:
+        token_doc = self.tokens.find_one({
+            "token": token,
+            "expires_at": {"$gt": Config.get_current_utc_time()}
+        })
+        return token_doc
 
     def update_user(self, email: str, update_data: Dict) -> bool:
         try:
@@ -104,7 +117,7 @@ class Database:
             )
             return result.modified_count > 0
         except Exception as e:
-            st.error(f"Error updating user: {e}")
+            st.error(f"Erro ao atualizar o usuário: {e}")
             return False
 
     def delete_token(self, token: str) -> bool:
@@ -112,8 +125,17 @@ class Database:
             result = self.tokens.delete_one({"token": token})
             return result.deleted_count > 0
         except Exception as e:
-            st.error(f"Error deleting token: {e}")
+            st.error(f"Erro ao excluir o token: {e}")
             return False
+
+    def cleanup_expired_tokens(self):
+        """Remove expired tokens from database"""
+        try:
+            self.tokens.delete_many({
+                "expires_at": {"$lt": Config.get_current_utc_time()}
+            })
+        except Exception as e:
+            st.error(f"Erro ao limpar tokens: {e}")
 
 class EmailService:
     """Email service using SendGrid"""
@@ -128,19 +150,19 @@ class EmailService:
             message = Mail(
                 from_email=Email(Config.SENDER_EMAIL, Config.SENDER_NAME),
                 to_emails=To(email, name),
-                subject="Account Validation - Warehouse System",
+                subject="Validação de conta - Warehouse App",
                 html_content=Content("text/html", self._get_email_template(validation_url, name))
             )
             
             response = self.client.send(message)
             if response.status_code in [200, 202]:
-                st.info(f"Validation email sent to {email}")
+                st.info(f"E-mail de validação enviado para {email}")
                 return True
             
-            st.error(f"Error sending email: {response.body}")
+            st.error(f"Erro ao enviar e-mail: {response.body}")
             return False
         except Exception as e:
-            st.error(f"Error sending email: {e}")
+            st.error(f"Erro ao enviar e-mail: {e}")
             return False
 
     @staticmethod
@@ -149,22 +171,65 @@ class EmailService:
         <!DOCTYPE html>
         <html>
         <head>
+            <meta charset="UTF-8">
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; }}
-                .container {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 20px; }}
-                .button {{ display: inline-block; background-color: #0075be; color: white; text-decoration: none;
-                          padding: 12px 24px; border-radius: 4px; transition: background-color 0.3s ease; }}
-                .button:hover {{ background-color: #0056b3; }}
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                    margin: 0;
+                    padding: 20px;
+                    line-height: 1.5;
+                    color: #000;
+                }}
+                .logo-container {{
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    margin-bottom: 20px;
+                }}
+                .checkmark {{
+                    color: #22c55e;
+                    font-size: 24px;
+                }}
+                .system-name {{
+                    color: #0066cc;
+                    font-size: 24px;
+                    font-weight: normal;
+                    margin: 0;
+                }}
+                .validation-button {{
+                    display: inline-block;
+                    background-color: #0066cc;
+                    color: white;
+                    text-decoration: none;
+                    padding: 8px 16px;
+                    border-radius: 4px;
+                    margin: 20px 0;
+                }}
+                .footer {{
+                    margin-top: 20px;
+                    color: #666;
+                    font-size: 14px;
+                }}
+                .footer p {{
+                    margin: 8px 0;
+                }}
             </style>
         </head>
         <body>
-            <div class="container">
-                <h1>Warehouse System - Account Validation</h1>
-                <p>Hello {name},</p>
-                <p>To validate your Warehouse System account, click the link below:</p>
-                <p><a href="{validation_url}" class="button">Validate Account</a></p>
-                <p>This link expires in 7 days.</p>
-                <p>If you didn't request this validation, please ignore this email.</p>
+            <div class="logo-container">
+                <span class="checkmark">✓</span>
+                <span class="system-name">Warehouse System</span>
+            </div>
+
+            <p>Olá {name},</p>
+            
+            <p>Para ativar sua conta no Warehouse System, clique no botão abaixo:</p>
+            
+            <a href="{validation_url}" class="validation-button">Validar Minha Conta</a>
+
+            <div class="footer">
+                <p>⏳ Este link é válido por 7 dias</p>
+                <p>❗ Se você não reconhece esta solicitação, por favor ignore este e-mail</p>
             </div>
         </body>
         </html>
@@ -183,19 +248,19 @@ class UserService:
 
     def validate_registration(self, name: str, email: str, password: str, phone: str) -> bool:
         if not all([name, email, password, phone]):
-            st.error("All fields are required")
+            st.error("Todos os campos são obrigatórios")
             return False
 
         if not email.endswith(Config.ALLOWED_EMAIL_DOMAIN):
-            st.error(f"Email must end with {Config.ALLOWED_EMAIL_DOMAIN}")
+            st.error(f"O e-mail deve terminar com {Config.ALLOWED_EMAIL_DOMAIN}")
             return False
 
         if not password.isdigit() or len(password) != Config.MIN_PASSWORD_LENGTH:
-            st.error(f"Password must be exactly {Config.MIN_PASSWORD_LENGTH} digits")
+            st.error(f"A senha deve ser exatamente {Config.MIN_PASSWORD_LENGTH} digitos")
             return False
 
         if self.db.find_user(email):
-            st.error("Email already registered")
+            st.error("E-mail já cadastrado")
             return False
 
         return True
@@ -214,60 +279,64 @@ class UserService:
         }
         
         if self.db.create_user(user_data):
-            if self.db.create_token({"token": token, "email": email}):
+            if self.db.create_token({
+                "token": token, 
+                "email": email,
+                "type": "validation"
+            }):
                 if self.email.send_validation_email(email, token, name):
-                    st.success("Registration successful! Check your email to validate your account.")
+                    st.success("Cadastro realizado com sucesso! Verifique seu e-mail para validar sua conta.")
                     return True
         
-        st.error("Error creating user. Please try again.")
+        st.error("Erro ao criar usuário. Por favor, tente novamente.")
         return False
 
     def validate_token(self, token: str) -> bool:
-        token_doc = self.db.find_token(token)
-        if not token_doc:
-            st.error("Invalid or expired token")
-            return False
-
-        token_creation = token_doc['created_at'].replace(tzinfo=timezone.utc)
-        if Config.get_current_utc_time() > token_creation + timedelta(hours=Config.TOKEN_EXPIRY_HOURS):
-            self.db.delete_token(token)
-            st.error("Token expired. Please register again.")
+        token_doc = self.db.find_valid_token(token)
+        if not token_doc or token_doc.get('type') != 'validation':
+            st.error("Token de validação inválido ou expirado")
             return False
 
         if self.db.update_user(token_doc['email'], {"verified": True}):
             self.db.delete_token(token)
-            st.success("Account validated successfully! You can now login.")
+            st.success("Conta validada com sucesso! Agora você pode fazer login.")
             return True
         return False
 
     def login(self, email: str, password: str) -> bool:
         if not email or not password:
-            st.error("Fill in all fields")
+            st.error("Preencha todos os campos")
             return False
 
         user = self.db.find_user(email)
         if not user or not user.get('verified', False):
-            st.error("Invalid credentials or unverified account")
+            st.error("Credenciais inválidas ou conta não verificada")
             return False
 
         if user['password'] != hashlib.sha256(password.encode()).hexdigest():
-            st.error("Invalid credentials")
+            st.error("Credenciais inválidas")
             return False
 
+        # Create new authentication token
         token = secrets.token_urlsafe(32)
-        if self.db.create_token({"token": token, "email": email}):
+        if self.db.create_token({
+            "token": token,
+            "email": email,
+            "type": "auth"
+        }):
             st.session_state.update({
                 'auth_token': token,
                 'user': {
                     'name': user['name'],
                     'email': user['email'],
+                    'phone': user['phone'],
                     'initials': self.get_initials(user['name'])
                 },
                 'logged_in': True
             })
             return True
 
-        st.error("Login error. Please try again.")
+        st.error("Erro ao fazer login. Por favor, tente novamente.")
         return False
 
     def logout(self):
@@ -278,11 +347,10 @@ class UserService:
 
     def check_login(self):
         if 'auth_token' in st.session_state:
-            token_doc = self.db.find_token(st.session_state.auth_token)
-            if token_doc:
-                token_creation = token_doc['created_at'].replace(tzinfo=timezone.utc)
-                if Config.get_current_utc_time() <= token_creation + timedelta(hours=Config.TOKEN_EXPIRY_HOURS):
-                    user = self.db.find_user(token_doc['email'])
+            token_doc = self.db.find_valid_token(st.session_state.auth_token)
+            if token_doc and token_doc.get('type') == 'auth':
+                user = self.db.find_user(token_doc['email'])
+                if user:
                     st.session_state.update({
                         'user': {
                             'name': user['name'],
@@ -305,6 +373,8 @@ class WarehouseApp:
         if 'logged_in' not in st.session_state:
             st.session_state.logged_in = False
         
+        # Clean up expired tokens periodically
+        self.db.cleanup_expired_tokens()
         self.user_service.check_login()
 
     def render_login_page(self):
@@ -317,7 +387,7 @@ class WarehouseApp:
             st.query_params.clear()
             st.rerun()
         
-        tab1, tab2 = col1.tabs(["Login", "Register"])
+        tab1, tab2 = col1.tabs(["Login", "Registro"])
         
         with tab1:
             with st.form("login_form"):
@@ -328,20 +398,20 @@ class WarehouseApp:
                         if self.user_service.login(email, password):
                             st.rerun()
                     else:
-                        st.error("Password must contain only numbers")
+                        st.error("A senha deve conter apenas números")
 
         with tab2:
             with st.form("register_form"):
-                name = st.text_input("Full Name")
+                name = st.text_input("Nome Completo")
                 email = st.text_input("Email (@andritz.com)").lower()
-                phone = st.text_input("Phone", placeholder="(XX) XXXXX-XXXX")
-                password = st.text_input("Password (6 digits)", type="password", help="Numbers only")
+                phone = st.text_input("N° Telefone", placeholder="(XX) XXXXX-XXXX")
+                password = st.text_input("Senha (6 digits)", type="password", help="Numbers only")
                 
-                if st.form_submit_button("Register"):
+                if st.form_submit_button("Salvar"):
                     if password.isdigit():
                         self.user_service.create_user(name, email, password, phone)
                     else:
-                        st.error("Password must contain only numbers")
+                        st.error("A senha deve conter apenas números")
         
         col2.image("login (8).jpg", width=400)
 
@@ -370,7 +440,8 @@ class WarehouseApp:
             current_path = st.query_params.get("page", "")
             if current_path != "00_home":
                 st.switch_page("pages/00_home.py")
-
+            # if current_path != "06_editavel":
+            #     st.switch_page("pages/06_editavel.py")
 def main():
     WarehouseApp().run()
 

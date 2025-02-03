@@ -9,7 +9,7 @@ import io
 from bson.objectid import ObjectId
 import streamlit.components.v1 as components
 
-def normalize_string_edit(texto):
+def normalize_string_epi(texto):
     """
     Normaliza uma string removendo acentos e caracteres especiais
     """
@@ -22,17 +22,17 @@ def normalize_string_edit(texto):
     )
     return re.sub(r'[^\w\s]', '', texto)
 
-def criar_padrao_flexivel_edit(texto):
+def criar_padrao_flexivel_epi(texto):
     """
     Cria um padrão de busca flexível para pesquisa case-insensitive
     """
-    normalizado = normalize_string_edit(texto)
+    normalizado = normalize_string_epi(texto)
     fragmentos = normalizado.split()
     padrao = '.*'.join(f'(?=.*{re.escape(fragmento)})' for fragmento in fragmentos)
     return padrao + '.*'
 
 @st.cache_resource
-def obter_cliente_mongodb_edit():
+def obter_cliente_mongodb_epi():
     """
     Estabelece conexão com o MongoDB usando credenciais do Streamlit
     """
@@ -48,22 +48,22 @@ def obter_cliente_mongodb_edit():
     return MongoClient(URI)
 
 @st.cache_data
-def obter_colunas_edit_colecao_edit_edit(nome_colecao_edit):
+def obter_colunas_epi_colecao_epi_epi(nome_colecao_epi):
     """
-    Obtém as colunas_edit disponíveis em uma coleção do MongoDB
+    Obtém as colunas_epi disponíveis em uma coleção do MongoDB
     """
-    cliente = obter_cliente_mongodb_edit()
+    cliente = obter_cliente_mongodb_epi()
     db = cliente.warehouse
-    colecao_edit = db[nome_colecao_edit]
+    colecao_epi = db[nome_colecao_epi]
     
-    total_docs = colecao_edit.count_documents({})
-    doc_exemplo = colecao_edit.find_one()
+    total_docs = colecao_epi.count_documents({})
+    doc_exemplo = colecao_epi.find_one()
     
-    colunas_edit = []
+    colunas_epi = []
     if doc_exemplo:
-        colunas_edit = [col for col in doc_exemplo.keys() if col != '_id']
+        colunas_epi = [col for col in doc_exemplo.keys() if col != '_id']
     
-    colunas_edit_padrao = {
+    colunas_epi_padrao = {
         'xml': [
             'url_imagens',
             'Nota Fiscal', 
@@ -101,39 +101,68 @@ def obter_colunas_edit_colecao_edit_edit(nome_colecao_edit):
         'po': [
             'Item', 
             'Supplier',
+        ],
+        'reqepi': [
+            'url_imagens',
+            'Item',
+            'Cod. Material',
+            'Descrição',
+            'Cod. Material Atendido',
+            'Descrição Material Atendido',
+            'Qtd. Solicitada',
+            'Qtd. Atendida',
+            'Unid.',
+            'Valor',
+            'Valor Total',
+            'Requisição',
+            'Solicitante',
+            'Chave NF-e',  
+            'Data',
+            'CC - WBS',
+            'Obra - Setor',
+            'ID_Solicitante',
+            'Status',
+            'Nome do Arquivo',
+            'Mes_Numero',
+            'Mes',
+            'Ano',
+            'Dia',
+            'Mes/Ano',
+            'req_cod',
+            'unique'
         ]
     }
     
-    fallback = colunas_edit_padrao.get(nome_colecao_edit, colunas_edit[:26])
-    padroes_finais = [col for col in fallback if col in colunas_edit]
+    fallback = colunas_epi_padrao.get(nome_colecao_epi, colunas_epi[:26])
+    padroes_finais = [col for col in fallback if col in colunas_epi]
     
     if not padroes_finais:
-        padroes_finais = colunas_edit[:10]
+        padroes_finais = colunas_epi[:10]
     
-    return total_docs, colunas_edit, padroes_finais
+    return total_docs, colunas_epi, padroes_finais
 
 class GerenciadorCartoes:
     """
     Gerencia as operações de cartões (cards) na interface
     """
-    def __init__(self, nome_colecao_edit):
-        self.nome_colecao_edit = nome_colecao_edit
+    def __init__(self, nome_colecao_epi):
+        self.nome_colecao_epi = nome_colecao_epi
         if 'cartoes_edicao' not in st.session_state:
             st.session_state.cartoes_edicao = set()
         if 'cartoes_exclusao' not in st.session_state:
             st.session_state.cartoes_exclusao = set()
 
-    def obter_colecao_edit_edit(self):
-        cliente = obter_cliente_mongodb_edit()
-        return cliente.warehouse[self.nome_colecao_edit]
+    def obter_colecao_epi_epi(self):
+        cliente = obter_cliente_mongodb_epi()
+        return cliente.warehouse[self.nome_colecao_epi]
 
-    def atualizar_documento_edit(self, id_cartao, dados):
+    def atualizar_documento_epi(self, id_cartao, dados):
         """
         Atualiza um documento no MongoDB
         """
         try:
-            colecao_edit = self.obter_colecao_edit_edit()
-            colecao_edit.update_one(
+            colecao_epi = self.obter_colecao_epi_epi()
+            colecao_epi.update_one(
                 {"_id": ObjectId(id_cartao)},
                 {"$set": dados}
             )
@@ -141,45 +170,45 @@ class GerenciadorCartoes:
         except Exception as e:
             return False, f"Erro na atualização: {str(e)}"
 
-    def excluir_documento_edit(self, id_cartao):
+    def excluir_documento_epi(self, id_cartao):
         """
         Exclui um documento do MongoDB
         """
         try:
-            colecao_edit = self.obter_colecao_edit_edit()
-            colecao_edit.delete_one({"_id": ObjectId(id_cartao)})
+            colecao_epi = self.obter_colecao_epi_epi()
+            colecao_epi.delete_one({"_id": ObjectId(id_cartao)})
             return True, "Registro excluído com sucesso!"
         except Exception as e:
             return False, f"Erro na exclusão: {str(e)}"
 
-    def renderizar_modal_edicao_edit(self, id_cartao, registro, colunas_edit_visiveis, colunas_edit_imagem):
+    def renderizar_modal_edicao_epi(self, id_cartao, registro, colunas_epi_visiveis, colunas_epi_imagem):
         """
         Renderiza o modal de edição de um cartão
         """
         with st.container():
-            dados_editados = {}
-            for col in colunas_edit_visiveis:
+            dados_epiados = {}
+            for col in colunas_epi_visiveis:
                 valor_atual = registro.get(col, "")
                 
                 if col == '_id':
                     st.text_input(
                         "ID do Documento",
                         value=valor_atual,
-                        key=f"edit_{self.nome_colecao_edit}_{id_cartao}_{col}",
+                        key=f"edit_{self.nome_colecao_epi}_{id_cartao}_{col}",
                         disabled=True
                     )
                     continue
                 
-                dados_editados[col] = st.text_input(
+                dados_epiados[col] = st.text_input(
                     col,
                     valor_atual,
-                    key=f"edit_{self.nome_colecao_edit}_{id_cartao}_{col}"
+                    key=f"edit_{self.nome_colecao_epi}_{id_cartao}_{col}"
                 )
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("Salvar", type="primary", key=f"save_{self.nome_colecao_edit}_{id_cartao}"):
-                    sucesso, mensagem = self.atualizar_documento_edit(id_cartao, dados_editados)
+                if st.button("Salvar", type="primary", key=f"save_{self.nome_colecao_epi}_{id_cartao}"):
+                    sucesso, mensagem = self.atualizar_documento_epi(id_cartao, dados_epiados)
                     if sucesso:
                         st.success(mensagem)
                         st.session_state.cartoes_edicao.remove(id_cartao)
@@ -187,11 +216,11 @@ class GerenciadorCartoes:
                     else:
                         st.error(mensagem)
             with col2:
-                if st.button("Cancelar", key=f"cancel_edit_{self.nome_colecao_edit}_{id_cartao}"):
+                if st.button("Cancelar", key=f"cancel_epi_{self.nome_colecao_epi}_{id_cartao}"):
                     st.session_state.cartoes_edicao.remove(id_cartao)
                     st.rerun()
 
-    def renderizar_modal_exclusao_edit(self, id_cartao):
+    def renderizar_modal_exclusao_epi(self, id_cartao):
         """
         Renderiza o modal de confirmação de exclusão
         """
@@ -204,9 +233,9 @@ class GerenciadorCartoes:
                 if st.button(
                     "Sim, Excluir",
                     type="primary",
-                    key=f"confirm_delete_{self.nome_colecao_edit}_{id_cartao}"
+                    key=f"confirm_delete_{self.nome_colecao_epi}_{id_cartao}"
                 ):
-                    sucesso, mensagem = self.excluir_documento_edit(id_cartao)
+                    sucesso, mensagem = self.excluir_documento_epi(id_cartao)
                     if sucesso:
                         st.success(mensagem)
                         st.session_state.cartoes_exclusao.remove(id_cartao)
@@ -216,17 +245,17 @@ class GerenciadorCartoes:
             with col2:
                 if st.button(
                     "Cancelar",
-                    key=f"cancel_delete_{self.nome_colecao_edit}_{id_cartao}"
+                    key=f"cancel_delete_{self.nome_colecao_epi}_{id_cartao}"
                 ):
                     st.session_state.cartoes_exclusao.remove(id_cartao)
                     st.rerun()
 
-def obter_valores_unicos_edit(nome_colecao_edit, coluna):
+def obter_valores_unicos_epi(nome_colecao_epi, coluna):
     """
     Obtém valores únicos de uma coluna para filtros
     """
-    cliente = obter_cliente_mongodb_edit()
-    colecao_edit = cliente.warehouse[nome_colecao_edit]
+    cliente = obter_cliente_mongodb_epi()
+    colecao_epi = cliente.warehouse[nome_colecao_epi]
     
     pipeline = [
         {"$group": {"_id": f"${coluna}"}},
@@ -236,7 +265,7 @@ def obter_valores_unicos_edit(nome_colecao_edit, coluna):
     
     try:
         valores_unicos = [
-            doc["_id"] for doc in colecao_edit.aggregate(pipeline)
+            doc["_id"] for doc in colecao_epi.aggregate(pipeline)
             if doc["_id"] is not None
         ]
         return sorted(valores_unicos)
@@ -244,7 +273,7 @@ def obter_valores_unicos_edit(nome_colecao_edit, coluna):
         st.error(f"Erro ao obter valores únicos para {coluna}: {str(e)}")
         return []
 
-def converter_para_numerico_edit(valor):
+def converter_para_numerico_epi(valor):
     """
     Converte um valor para numérico, se possível
     """
@@ -257,20 +286,20 @@ def converter_para_numerico_edit(valor):
         except ValueError:
             return valor
 
-def obter_tipos_colunas_edit_edit(nome_colecao_edit):
+def obter_tipos_colunas_epi_epi(nome_colecao_epi):
     """
-    Determina os tipos de dados das colunas_edit
+    Determina os tipos de dados das colunas_epi
     """
     try:
-        cliente = obter_cliente_mongodb_edit()
-        colecao_edit = cliente.warehouse[nome_colecao_edit]
-        doc_exemplo = colecao_edit.find_one()
+        cliente = obter_cliente_mongodb_epi()
+        colecao_epi = cliente.warehouse[nome_colecao_epi]
+        doc_exemplo = colecao_epi.find_one()
         
         if not doc_exemplo:
-            st.warning(f"Nenhum documento encontrado na coleção {nome_colecao_edit}")
+            st.warning(f"Nenhum documento encontrado na coleção {nome_colecao_epi}")
             return {}
         
-        def determinar_tipo_edit(valor):
+        def determinar_tipo_epi(valor):
             if valor is None:
                 return 'str'
             if isinstance(valor, int):
@@ -289,12 +318,12 @@ def obter_tipos_colunas_edit_edit(nome_colecao_edit):
                         return 'str'
             return 'str'
         
-        return {k: determinar_tipo_edit(v) for k, v in doc_exemplo.items() if k != '_id'}
+        return {k: determinar_tipo_epi(v) for k, v in doc_exemplo.items() if k != '_id'}
     except Exception as e:
-        st.error(f"Erro ao obter tipos de colunas_edit: {str(e)}")
+        st.error(f"Erro ao obter tipos de colunas_epi: {str(e)}")
         return {}
 
-def construir_query_mongo_edit(filtros, tipos_colunas_edit):
+def construir_query_mongo_epi(filtros, tipos_colunas_epi):
     """
     Constrói a query do MongoDB baseada nos filtros aplicados
     """
@@ -307,9 +336,9 @@ def construir_query_mongo_edit(filtros, tipos_colunas_edit):
         if not valor_filtro:
             continue
         
-        if tipos_colunas_edit.get(coluna, 'str') in ['int64', 'float64']:
+        if tipos_colunas_epi.get(coluna, 'str') in ['int64', 'float64']:
             try:
-                valor_numerico = converter_para_numerico_edit(valor_filtro)
+                valor_numerico = converter_para_numerico_epi(valor_filtro)
                 if isinstance(valor_numerico, (int, float)):
                     query[coluna] = valor_numerico
                     continue
@@ -317,7 +346,7 @@ def construir_query_mongo_edit(filtros, tipos_colunas_edit):
                 pass
         
         if tipo_filtro == 'texto':
-            padrao = criar_padrao_flexivel_edit(valor_filtro)
+            padrao = criar_padrao_flexivel_epi(valor_filtro)
             query[coluna] = {'$regex': padrao, '$options': 'i'}
         elif tipo_filtro == 'multi':
             if valor_filtro:
@@ -325,56 +354,56 @@ def construir_query_mongo_edit(filtros, tipos_colunas_edit):
     
     return query
 
-def criar_interface_filtros_edit(nome_colecao_edit, colunas_edit):
+def criar_interface_filtros_epi(nome_colecao_epi, colunas_epi):
     """
     Cria a interface de filtros para a coleção
     """
-    tipos_colunas_edit = obter_tipos_colunas_edit_edit(nome_colecao_edit)
+    tipos_colunas_epi = obter_tipos_colunas_epi_epi(nome_colecao_epi)
     filtros = {}
     
     with st.expander("**Filtros:**", expanded=False):
-        colunas_edit_selecionadas = st.multiselect(
+        colunas_epi_selecionadas = st.multiselect(
             "Selecione as Colunas para filtrar:",
-            colunas_edit,
-            key=f"filter_cols_{nome_colecao_edit}"
+            colunas_epi,
+            key=f"filter_cols_{nome_colecao_epi}"
         )
         
-        if colunas_edit_selecionadas:
+        if colunas_epi_selecionadas:
             cols = st.columns(2)
-            for idx, coluna in enumerate(colunas_edit_selecionadas):
+            for idx, coluna in enumerate(colunas_epi_selecionadas):
                 with cols[idx % 2]:
                     st.markdown(f"#### {coluna}")
-                    tipo_coluna = tipos_colunas_edit.get(coluna, 'str')
+                    tipo_coluna = tipos_colunas_epi.get(coluna, 'str')
                     tipo_filtro = st.radio(
                         "Tipo de filtro:",
                         ["Texto", "Seleção Múltipla"],
-                        key=f"radio_{nome_colecao_edit}_{coluna}",
+                        key=f"radio_{nome_colecao_epi}_{coluna}",
                         horizontal=True
                     )
                     
                     if tipo_filtro == "Texto":
                         valor = st.text_input(
                             f"Buscar {coluna}" + (" (numérico)" if tipo_coluna in ['int64', 'float64'] else ""),
-                            key=f"text_filter_{nome_colecao_edit}_{coluna}"
+                            key=f"text_filter_{nome_colecao_epi}_{coluna}"
                         )
                         if valor:
                             filtros[coluna] = {'tipo': 'texto', 'valor': valor}
                     else:
-                        valores_unicos = obter_valores_unicos_edit(nome_colecao_edit, coluna)
+                        valores_unicos = obter_valores_unicos_epi(nome_colecao_epi, coluna)
                         if valores_unicos:
                             selecionados = st.multiselect(
                                 "Selecione os valores:",
                                 options=valores_unicos,
-                                key=f"multi_filter_{nome_colecao_edit}_{coluna}"
+                                key=f"multi_filter_{nome_colecao_epi}_{coluna}"
                             )
                             if selecionados:
                                 filtros[coluna] = {'tipo': 'multi', 'valor': selecionados}
                     
                     st.markdown("---")
     
-    return filtros, tipos_colunas_edit
+    return filtros, tipos_colunas_epi
 
-def converter_para_pandas_edit(doc):
+def converter_para_pandas_epi(doc):
     """
     Converte um documento do MongoDB para formato compatível com Pandas
     """
@@ -383,38 +412,38 @@ def converter_para_pandas_edit(doc):
         if isinstance(valor, ObjectId):
             convertido[chave] = str(valor)
         elif isinstance(valor, dict):
-            convertido[chave] = converter_para_pandas_edit(valor)
+            convertido[chave] = converter_para_pandas_epi(valor)
         elif isinstance(valor, list):
             convertido[chave] = [str(item) if isinstance(item, ObjectId) else item for item in valor]
         else:
             convertido[chave] = valor
     return convertido
 
-def carregar_dados_paginados_edit(nome_colecao_edit, pagina, tamanho_pagina, filtros=None, tipos_colunas_edit=None):
+def carregar_dados_paginados_epi(nome_colecao_epi, pagina, tamanho_pagina, filtros=None, tipos_colunas_epi=None):
     """
     Carrega dados paginados da coleção do MongoDB
     """
-    if tipos_colunas_edit is None:
-        tipos_colunas_edit = obter_tipos_colunas_edit_edit(nome_colecao_edit)
+    if tipos_colunas_epi is None:
+        tipos_colunas_epi = obter_tipos_colunas_epi_epi(nome_colecao_epi)
     
-    cliente = obter_cliente_mongodb_edit()
-    colecao_edit = cliente.warehouse[nome_colecao_edit]
-    query = construir_query_mongo_edit(filtros, tipos_colunas_edit) if filtros else {}
+    cliente = obter_cliente_mongodb_epi()
+    colecao_epi = cliente.warehouse[nome_colecao_epi]
+    query = construir_query_mongo_epi(filtros, tipos_colunas_epi) if filtros else {}
     pular = (pagina - 1) * tamanho_pagina
     
     try:
-        ordenacao = [("Data Emissao", -1)] if nome_colecao_edit == 'xml' else None
-        total_filtrado = colecao_edit.count_documents(query)
+        ordenacao = [("Data Emissao", -1)] if nome_colecao_epi == 'xml' else None
+        total_filtrado = colecao_epi.count_documents(query)
         
         if ordenacao:
             try:
-                cursor = colecao_edit.find(query).sort(ordenacao).skip(pular).limit(tamanho_pagina)
+                cursor = colecao_epi.find(query).sort(ordenacao).skip(pular).limit(tamanho_pagina)
             except Exception:
-                cursor = colecao_edit.find(query).skip(pular).limit(tamanho_pagina)
+                cursor = colecao_epi.find(query).skip(pular).limit(tamanho_pagina)
         else:
-            cursor = colecao_edit.find(query).skip(pular).limit(tamanho_pagina)
+            cursor = colecao_epi.find(query).skip(pular).limit(tamanho_pagina)
         
-        documentos = [converter_para_pandas_edit(doc) for doc in cursor]
+        documentos = [converter_para_pandas_epi(doc) for doc in cursor]
         df = pd.DataFrame(documentos)
         
         return df, total_filtrado
@@ -422,7 +451,7 @@ def carregar_dados_paginados_edit(nome_colecao_edit, pagina, tamanho_pagina, fil
         st.error(f"Erro ao carregar dados: {str(e)}")
         return pd.DataFrame(), 0
 
-def processar_urls_edit(urls):
+def processar_urls_epi(urls):
     """
     Processa URLs de imagens para exibição
     """
@@ -437,7 +466,7 @@ def processar_urls_edit(urls):
         return urls_validas[0] if urls_validas else None
     return None
 
-def formatar_valor_edit(valor):
+def formatar_valor_epi(valor):
     """
     Formata valores para exibição nos cartões
     """
@@ -460,33 +489,33 @@ def formatar_valor_edit(valor):
             return str(valor)[:35]
     return str(valor)[:35]
 
-def renderizar_cartoes_edit(df, colunas_edit_visiveis, nome_colecao_edit):
+def renderizar_cartoes_epi(df, colunas_epi_visiveis, nome_colecao_epi):
     """
     Renderiza os cartões de dados na interface
     """
-    gerenciador = GerenciadorCartoes(nome_colecao_edit)
-    colunas_edit_imagem = [col for col in df.columns if 'url_imagens' in col.lower()]
-    num_colunas_edit = 5
-    linhas = [df.iloc[i:i+num_colunas_edit] for i in range(0, len(df), num_colunas_edit)]
+    gerenciador = GerenciadorCartoes(nome_colecao_epi)
+    colunas_epi_imagem = [col for col in df.columns if 'url_imagens' in col.lower()]
+    num_colunas_epi = 5
+    linhas = [df.iloc[i:i+num_colunas_epi] for i in range(0, len(df), num_colunas_epi)]
     
     for idx_linha, linha in enumerate(linhas):
-        cols = st.columns(num_colunas_edit)
+        cols = st.columns(num_colunas_epi)
         
         for idx_col, (_, registro) in enumerate(linha.iterrows()):
             with cols[idx_col]:
                 url_imagem = None
-                for col_img in colunas_edit_imagem:
+                for col_img in colunas_epi_imagem:
                     if col_img in registro:
-                        url_imagem = processar_urls_edit(registro[col_img])
+                        url_imagem = processar_urls_epi(registro[col_img])
                         if url_imagem:
                             break
-                #Selecione as colunas_edit para filtrar
+                #Selecione as colunas_epi para filtrar
                 # Conteúdo do Cartão
                 detalhes_cartao = ''.join([
                     f'<div style="margin-bottom: 4px; font-size: 0.8rem;">'
-                    f'<strong>{col}:</strong> {formatar_valor_edit(registro.get(col, "-"))}</div>'
-                    for col in colunas_edit_visiveis 
-                    if col not in colunas_edit_imagem and col != '_id'
+                    f'<strong>{col}:</strong> {formatar_valor_epi(registro.get(col, "-"))}</div>'
+                    for col in colunas_epi_visiveis 
+                    if col not in colunas_epi_imagem and col != '_id'
                 ])
                 
                 estilo_cartao = (
@@ -523,14 +552,14 @@ def renderizar_cartoes_edit(df, colunas_edit_visiveis, nome_colecao_edit):
                 with col1:
                     if st.button(
                         "✏️ Editar",
-                        key=f"edit_btn_{nome_colecao_edit}_{registro['_id']}",
+                        key=f"edit_btn_{nome_colecao_epi}_{registro['_id']}",
                         use_container_width=True
                     ):
                         st.session_state.cartoes_edicao.add(str(registro['_id']))
                 with col2:
                     if st.button(
                         "🗑️ Excluir",
-                        key=f"delete_btn_{nome_colecao_edit}_{registro['_id']}",
+                        key=f"delete_btn_{nome_colecao_epi}_{registro['_id']}",
                         use_container_width=True
                     ):
                         st.session_state.cartoes_exclusao.add(str(registro['_id']))
@@ -538,41 +567,41 @@ def renderizar_cartoes_edit(df, colunas_edit_visiveis, nome_colecao_edit):
                 # Modais
                 id_cartao = str(registro['_id'])
                 if id_cartao in st.session_state.cartoes_edicao:
-                    gerenciador.renderizar_modal_edicao_edit(id_cartao, registro, colunas_edit_visiveis + ['_id'], colunas_edit_imagem)
+                    gerenciador.renderizar_modal_edicao_epi(id_cartao, registro, colunas_epi_visiveis + ['_id'], colunas_epi_imagem)
                 if id_cartao in st.session_state.cartoes_exclusao:
-                    gerenciador.renderizar_modal_exclusao_edit(id_cartao)
+                    gerenciador.renderizar_modal_exclusao_epi(id_cartao)
 
-def exibir_pagina_dados_edit(nome_colecao_edit):
+def exibir_pagina_dados_epi(nome_colecao_epi):
     """
-    Exibe a página principal_edit de dados para uma coleção
+    Exibe a página principal_epi de dados para uma coleção
     """
-    total_documentos, colunas_edit, padrao_visiveis = obter_colunas_edit_colecao_edit_edit(nome_colecao_edit)
+    total_documentos, colunas_epi, padrao_visiveis = obter_colunas_epi_colecao_epi_epi(nome_colecao_epi)
     
-    colunas_edit = [col for col in colunas_edit if col != '_id']
+    colunas_epi = [col for col in colunas_epi if col != '_id']
     padrao_visiveis = [col for col in padrao_visiveis if col != '_id']
     
     if total_documentos == 0:
-        st.error(f"Nenhum documento encontrado na coleção {nome_colecao_edit}")
+        st.error(f"Nenhum documento encontrado na coleção {nome_colecao_epi}")
         return
 
     with st.expander("**Colunas Visíveis:**", expanded=False):
-        chave_estado = f'colunas_edit_visiveis_{nome_colecao_edit}'
+        chave_estado = f'colunas_epi_visiveis_{nome_colecao_epi}'
         if chave_estado not in st.session_state:
             st.session_state[chave_estado] = padrao_visiveis
             
-        colunas_edit_visiveis = st.multiselect(
+        colunas_epi_visiveis = st.multiselect(
             "Selecione as Colunas para exibir:",
-            options=colunas_edit,
+            options=colunas_epi,
             default=st.session_state[chave_estado],
-            key=f'seletor_colunas_edit_{nome_colecao_edit}'
+            key=f'seletor_colunas_epi_{nome_colecao_epi}'
         )
-        st.session_state[chave_estado] = colunas_edit_visiveis
+        st.session_state[chave_estado] = colunas_epi_visiveis
         
-        if st.button("Mostrar Todas as Colunas", key=f"mostrar_todas_{nome_colecao_edit}"):
-            st.session_state[chave_estado] = colunas_edit
+        if st.button("Mostrar Todas as Colunas", key=f"mostrar_todas_{nome_colecao_epi}"):
+            st.session_state[chave_estado] = colunas_epi
             st.rerun()
 
-    filtros, tipos_colunas_edit = criar_interface_filtros_edit(nome_colecao_edit, colunas_edit)
+    filtros, tipos_colunas_epi = criar_interface_filtros_epi(nome_colecao_epi, colunas_epi)
     
     with st.expander("**Configurações:**", expanded=False):
         col1, col2, col3 = st.columns([1,1,1], gap='small')
@@ -584,25 +613,25 @@ def exibir_pagina_dados_edit(nome_colecao_edit):
                 "Registros por página:",
                 options=[10, 25, 50, 100],
                 index=1,
-                key=f"tamanho_pagina_{nome_colecao_edit}",
+                key=f"tamanho_pagina_{nome_colecao_epi}",
                 label_visibility='collapsed'
             )
         
-        chave_pagina = f'pagina_{nome_colecao_edit}'
+        chave_pagina = f'pagina_{nome_colecao_epi}'
         if chave_pagina not in st.session_state:
             st.session_state[chave_pagina] = 1
         pagina_atual = st.session_state[chave_pagina]
         
-        df, total_filtrado = carregar_dados_paginados_edit(
-            nome_colecao_edit,
+        df, total_filtrado = carregar_dados_paginados_epi(
+            nome_colecao_epi,
             pagina_atual,
             tamanho_pagina,
             filtros,
-            tipos_colunas_edit
+            tipos_colunas_epi
         )
         
-        if not df.empty and colunas_edit_visiveis:
-            df = df[colunas_edit_visiveis + ['_id']]
+        if not df.empty and colunas_epi_visiveis:
+            df = df[colunas_epi_visiveis + ['_id']]
         
         total_paginas = math.ceil(total_filtrado / tamanho_pagina) if total_filtrado > 0 else 1
         pagina_atual = min(pagina_atual, total_paginas)
@@ -620,14 +649,14 @@ def exibir_pagina_dados_edit(nome_colecao_edit):
             }
             
             for idx, (texto, callback) in enumerate(navegacao.items()):
-                if cols[idx].button(texto, key=f"{texto}_{nome_colecao_edit}"):
+                if cols[idx].button(texto, key=f"{texto}_{nome_colecao_epi}"):
                     callback()
                     st.rerun()
 
     if not df.empty:
-        renderizar_cartoes_edit(df, colunas_edit_visiveis, nome_colecao_edit)
+        renderizar_cartoes_epi(df, colunas_epi_visiveis, nome_colecao_epi)
         
-        if st.button("📥 Baixar dados filtrados", key=f"download_{nome_colecao_edit}"):
+        if st.button("📥 Baixar dados filtrados", key=f"download_{nome_colecao_epi}"):
             texto_progresso = "Preparando download..."
             barra_progresso = st.progress(0, text=texto_progresso)
             
@@ -639,9 +668,9 @@ def exibir_pagina_dados_edit(nome_colecao_edit):
                 progresso = pagina / total_paginas_download
                 barra_progresso.progress(progresso, text=f"{texto_progresso} ({pagina}/{total_paginas_download})")
                 
-                df_pagina, _ = carregar_dados_paginados_edit(nome_colecao_edit, pagina, tamanho_lote, filtros)
-                if colunas_edit_visiveis:
-                    df_pagina = df_pagina[colunas_edit_visiveis]
+                df_pagina, _ = carregar_dados_paginados_epi(nome_colecao_epi, pagina, tamanho_lote, filtros)
+                if colunas_epi_visiveis:
+                    df_pagina = df_pagina[colunas_epi_visiveis]
                 todos_dados.append(df_pagina)
             
             df_completo = pd.concat(todos_dados, ignore_index=True)
@@ -653,7 +682,7 @@ def exibir_pagina_dados_edit(nome_colecao_edit):
             st.download_button(
                 label="💾 Clique para baixar Excel",
                 data=buffer.getvalue(),
-                file_name=f'{nome_colecao_edit}_dados.xlsx',
+                file_name=f'{nome_colecao_epi}_dados.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
             
@@ -661,7 +690,7 @@ def exibir_pagina_dados_edit(nome_colecao_edit):
     else:
         st.warning("Nenhum dado encontrado com os filtros aplicados")
 
-def initialize_session_state_edit():
+def initialize_session_state_epi():
     """Initialize session state variables"""
     if 'user' not in st.session_state:
         st.session_state.user = {
@@ -671,7 +700,7 @@ def initialize_session_state_edit():
 
 
 
-def principal_edit():
+def principal_epi():
     st.set_page_config(
         page_title="Home Admin",
         page_icon="📊",
@@ -679,7 +708,7 @@ def principal_edit():
         initial_sidebar_state="collapsed"       
     )
     # Initialize session state
-    initialize_session_state_edit()
+    initialize_session_state_epi()
 
     with st.sidebar:    
         # Get user info from session state
@@ -759,17 +788,18 @@ def principal_edit():
 
     # Coluna 1
     with col1:
-        st.markdown('## **📊 :rainbow[Home Admin]**')
+        st.markdown('## **📊 :rainbow[Home Epi]**')
 
-    colecoes = ['xml', 'nfspdf', 'po']
-    abas = st.tabs([colecao_edit.upper() for colecao_edit in colecoes])
+    colecoes = ['reqepi','xml', 'nfspdf', 'po']
+    #colecoes = ['reqepi','xml', 'nfspdf', 'po']
+    abas = st.tabs([colecao_epi.upper() for colecao_epi in colecoes])
     
-    for aba, nome_colecao_edit in zip(abas, colecoes):
+    for aba, nome_colecao_epi in zip(abas, colecoes):
         with aba:
-            exibir_pagina_dados_edit(nome_colecao_edit)
+            exibir_pagina_dados_epi(nome_colecao_epi)
     
     st.divider()
     st.caption("Dashboard de Dados MongoDB v1.0")
 
 if __name__ == "__main__":
-    principal_edit()
+    principal_epi()
