@@ -181,7 +181,7 @@ class GerenciadorCartoes:
         except Exception as e:
             return False, f"Erro na exclusão: {str(e)}"
 
-    @st.dialog("Edição de Dados")
+    #@st.dialog("Edição de Dados")
     def renderizar_modal_edicao_epi(self, id_cartao, registro, colunas_epi_visiveis, colunas_epi_imagem):
         """
         Renderiza o modal de edição de um cartão
@@ -220,7 +220,7 @@ class GerenciadorCartoes:
                 if st.button("Cancelar", key=f"cancel_epi_{self.nome_colecao_epi}_{id_cartao}"):
                     st.session_state.cartoes_edicao.remove(id_cartao)
                     st.rerun()
-    @st.dialog("Exclusão de Dados")
+    #@st.dialog("Exclusão de Dados")
     def renderizar_modal_exclusao_epi(self, id_cartao):
         """
         Renderiza o modal de confirmação de exclusão
