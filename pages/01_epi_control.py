@@ -9,10 +9,7 @@ import io
 from bson.objectid import ObjectId
 import streamlit.components.v1 as components
 
-def normalize_string_epi(texto):
-    """
-    Normaliza uma string removendo acentos e caracteres especiais
-    """
+def normalize_string(texto):
     if not isinstance(texto, str):
         return str(texto)
     texto = texto.lower()
@@ -22,20 +19,14 @@ def normalize_string_epi(texto):
     )
     return re.sub(r'[^\w\s]', '', texto)
 
-def criar_padrao_flexivel_epi(texto):
-    """
-    Cria um padrão de busca flexível para pesquisa case-insensitive
-    """
-    normalizado = normalize_string_epi(texto)
+def criar_padrao_flexivel(texto):
+    normalizado = normalize_string(texto)
     fragmentos = normalizado.split()
     padrao = '.*'.join(f'(?=.*{re.escape(fragmento)})' for fragmento in fragmentos)
     return padrao + '.*'
 
 @st.cache_resource
-def obter_cliente_mongodb_epi():
-    """
-    Estabelece conexão com o MongoDB usando credenciais do Streamlit
-    """
+def obter_cliente_mongodb():
     usuario = st.secrets["MONGO_USERNAME"]
     senha = st.secrets["MONGO_PASSWORD"]
     cluster = st.secrets["MONGO_CLUSTER"]
@@ -48,22 +39,19 @@ def obter_cliente_mongodb_epi():
     return MongoClient(URI)
 
 @st.cache_data
-def obter_colunas_epi_colecao_epi_epi(nome_colecao_epi):
-    """
-    Obtém as colunas_epi disponíveis em uma coleção do MongoDB
-    """
-    cliente = obter_cliente_mongodb_epi()
+def obter_colunas_colecao(nome_colecao):
+    cliente = obter_cliente_mongodb()
     db = cliente.warehouse
-    colecao_epi = db[nome_colecao_epi]
+    colecao = db[nome_colecao]
     
-    total_docs = colecao_epi.count_documents({})
-    doc_exemplo = colecao_epi.find_one()
+    total_docs = colecao.count_documents({})
+    doc_exemplo = colecao.find_one()
     
-    colunas_epi = []
+    colunas = []
     if doc_exemplo:
-        colunas_epi = [col for col in doc_exemplo.keys() if col != '_id']
+        colunas = [col for col in doc_exemplo.keys() if col != '_id']
     
-    colunas_epi_padrao = {
+    colunas_padrao = {
         'xml': [
             'url_imagens',
             'Nota Fiscal', 
@@ -94,169 +82,109 @@ def obter_colunas_epi_colecao_epi_epi(nome_colecao_epi):
             'grupo',
             'subgrupo'
         ],
-        'nfspdf': [
-            'Competencia', 
-            'CNPJ Prestador'
-        ],
-        'po': [
-            'Item', 
-            'Supplier',
-        ],
+        'nfspdf': ['Competencia', 'CNPJ Prestador'],
+        'po': ['Item', 'Supplier'],
         'reqepi': [
             'url_imagens',
             'Item',
-            'Cod. Material',
-            'Descrição',
-            'Cod. Material Atendido',
+            'Código Material',
+            'Descrição Material',
+            'Código Material Atendido',
             'Descrição Material Atendido',
-            'Qtd. Solicitada',
-            'Qtd. Atendida',
-            'Unid',
-            'Valor',
+            'Quantidade Solicitada',
+            'Quantidade Atendida',
+            'Unidade',
+            'Valor Unitário',
             'Valor Total',
-            'Requisição',
-            'Solicitante',
-            'Chave NF-e',  
-            'Data',
-            'CC - WBS',
-            'Obra - Setor',
-            'ID_Solicitante',
-            'Status',
-            'Nome do Arquivo',
-            'Mes_Numero',
-            'Mes',
+            'Número Requisição',
+            'Nome Solicitante',
+            'Chave Nota Fiscal',
+            'Data Solicitação',
+            'Centro de Custo - WBS',
+            'Obra / Setor',
+            'ID Solicitante',
+            'Status Requisição',
+            'Nome Arquivo',
+            'Número Mês',
+            'Mês',
             'Ano',
-            'Dia',
-            'Mes/Ano',
-            'req_cod',
+            #'Dia',
+            'Mês/Ano',
+            'Código Requisição',
             'unique'
         ]
     }
     
-    fallback = colunas_epi_padrao.get(nome_colecao_epi, colunas_epi[:26])
-    padroes_finais = [col for col in fallback if col in colunas_epi]
+    fallback = colunas_padrao.get(nome_colecao, colunas[:26])
+    padroes_finais = [col for col in fallback if col in colunas]
     
     if not padroes_finais:
-        padroes_finais = colunas_epi[:10]
+        padroes_finais = colunas[:10]
     
-    return total_docs, colunas_epi, padroes_finais
+    return total_docs, colunas, padroes_finais
 
-class GerenciadorCartoes:
-    """
-    Gerencia as operações de cartões (cards) na interface
-    """
-    def __init__(self, nome_colecao_epi):
-        self.nome_colecao_epi = nome_colecao_epi
-        if 'cartoes_edicao' not in st.session_state:
-            st.session_state.cartoes_edicao = set()
-        if 'cartoes_exclusao' not in st.session_state:
-            st.session_state.cartoes_exclusao = set()
+def atualizar_documento(nome_colecao, id_documento, dados):
+    try:
+        cliente = obter_cliente_mongodb()
+        colecao = cliente.warehouse[nome_colecao]
+        colecao.update_one(
+            {"_id": ObjectId(id_documento)},
+            {"$set": dados}
+        )
+        return True, "Registro atualizado com sucesso!"
+    except Exception as e:
+        return False, f"Erro na atualização: {str(e)}"
 
-    def obter_colecao_epi_epi(self):
-        cliente = obter_cliente_mongodb_epi()
-        return cliente.warehouse[self.nome_colecao_epi]
+def excluir_documento(nome_colecao, id_documento):
+    try:
+        cliente = obter_cliente_mongodb()
+        colecao = cliente.warehouse[nome_colecao]
+        colecao.delete_one({"_id": ObjectId(id_documento)})
+        return True, "Registro excluído com sucesso!"
+    except Exception as e:
+        return False, f"Erro na exclusão: {str(e)}"
 
-    def atualizar_documento_epi(self, id_cartao, dados):
-        """
-        Atualiza um documento no MongoDB
-        """
-        try:
-            colecao_epi = self.obter_colecao_epi_epi()
-            colecao_epi.update_one(
-                {"_id": ObjectId(id_cartao)},
-                {"$set": dados}
-            )
-            return True, "Registro atualizado com sucesso!"
-        except Exception as e:
-            return False, f"Erro na atualização: {str(e)}"
+@st.dialog("Editar Registro", width="large")
+def dialog_edicao(nome_colecao, registro, colunas_visiveis):
+    dados_editados = {}
+    for col in colunas_visiveis:
+        if col != '_id':
+            valor_atual = registro.get(col, "")
+            dados_editados[col] = st.text_input(col, valor_atual)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Salvar", type="primary", use_container_width=True):
+            sucesso, mensagem = atualizar_documento(nome_colecao, str(registro['_id']), dados_editados)
+            if sucesso:
+                st.success(mensagem)
+                st.rerun()
+            else:
+                st.error(mensagem)
+    with col2:
+        if st.button("Cancelar", use_container_width=True):
+            st.rerun()
 
-    def excluir_documento_epi(self, id_cartao):
-        """
-        Exclui um documento do MongoDB
-        """
-        try:
-            colecao_epi = self.obter_colecao_epi_epi()
-            colecao_epi.delete_one({"_id": ObjectId(id_cartao)})
-            return True, "Registro excluído com sucesso!"
-        except Exception as e:
-            return False, f"Erro na exclusão: {str(e)}"
+@st.dialog("Confirmar Exclusão", width="small")
+def dialog_exclusao(nome_colecao, registro):
+    st.warning("Tem certeza que deseja excluir este registro?")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Sim, Excluir", type="primary", use_container_width=True):
+            sucesso, mensagem = excluir_documento(nome_colecao, str(registro['_id']))
+            if sucesso:
+                st.success(mensagem)
+                st.rerun()
+            else:
+                st.error(mensagem)
+    with col2:
+        if st.button("Cancelar", use_container_width=True):
+            st.rerun()
 
-    #@st.dialog("Edição de Dados")
-    def renderizar_modal_edicao_epi(self, id_cartao, registro, colunas_epi_visiveis, colunas_epi_imagem):
-        """
-        Renderiza o modal de edição de um cartão
-        """
-        with st.container():
-            dados_epiados = {}
-            for col in colunas_epi_visiveis:
-                valor_atual = registro.get(col, "")
-                
-                if col == '_id':
-                    st.text_input(
-                        "ID do Documento",
-                        value=valor_atual,
-                        key=f"edit_{self.nome_colecao_epi}_{id_cartao}_{col}",
-                        disabled=True
-                    )
-                    continue
-                
-                dados_epiados[col] = st.text_input(
-                    col,
-                    valor_atual,
-                    key=f"edit_{self.nome_colecao_epi}_{id_cartao}_{col}"
-                )
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Salvar", type="primary", key=f"save_{self.nome_colecao_epi}_{id_cartao}"):
-                    sucesso, mensagem = self.atualizar_documento_epi(id_cartao, dados_epiados)
-                    if sucesso:
-                        st.success(mensagem)
-                        st.session_state.cartoes_edicao.remove(id_cartao)
-                        st.rerun()
-                    else:
-                        st.error(mensagem)
-            with col2:
-                if st.button("Cancelar", key=f"cancel_epi_{self.nome_colecao_epi}_{id_cartao}"):
-                    st.session_state.cartoes_edicao.remove(id_cartao)
-                    st.rerun()
-    #@st.dialog("Exclusão de Dados")
-    def renderizar_modal_exclusao_epi(self, id_cartao):
-        """
-        Renderiza o modal de confirmação de exclusão
-        """
-        dialog = st.container()
-        
-        with dialog:
-            st.warning("Tem certeza que deseja excluir este registro?")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button(
-                    "Sim, Excluir",
-                    type="primary",
-                    key=f"confirm_delete_{self.nome_colecao_epi}_{id_cartao}"
-                ):
-                    sucesso, mensagem = self.excluir_documento_epi(id_cartao)
-                    if sucesso:
-                        st.success(mensagem)
-                        st.session_state.cartoes_exclusao.remove(id_cartao)
-                        st.rerun()
-                    else:
-                        st.error(mensagem)
-            with col2:
-                if st.button(
-                    "Cancelar",
-                    key=f"cancel_delete_{self.nome_colecao_epi}_{id_cartao}"
-                ):
-                    st.session_state.cartoes_exclusao.remove(id_cartao)
-                    st.rerun()
-
-def obter_valores_unicos_epi(nome_colecao_epi, coluna):
-    """
-    Obtém valores únicos de uma coluna para filtros
-    """
-    cliente = obter_cliente_mongodb_epi()
-    colecao_epi = cliente.warehouse[nome_colecao_epi]
+def obter_valores_unicos(nome_colecao, coluna):
+    cliente = obter_cliente_mongodb()
+    colecao = cliente.warehouse[nome_colecao]
     
     pipeline = [
         {"$group": {"_id": f"${coluna}"}},
@@ -266,7 +194,7 @@ def obter_valores_unicos_epi(nome_colecao_epi, coluna):
     
     try:
         valores_unicos = [
-            doc["_id"] for doc in colecao_epi.aggregate(pipeline)
+            doc["_id"] for doc in colecao.aggregate(pipeline)
             if doc["_id"] is not None
         ]
         return sorted(valores_unicos)
@@ -274,10 +202,7 @@ def obter_valores_unicos_epi(nome_colecao_epi, coluna):
         st.error(f"Erro ao obter valores únicos para {coluna}: {str(e)}")
         return []
 
-def converter_para_numerico_epi(valor):
-    """
-    Converte um valor para numérico, se possível
-    """
+def converter_para_numerico(valor):
     valor_limpo = str(valor).strip().replace(',', '.')
     try:
         return int(valor_limpo)
@@ -287,47 +212,34 @@ def converter_para_numerico_epi(valor):
         except ValueError:
             return valor
 
-def obter_tipos_colunas_epi_epi(nome_colecao_epi):
-    """
-    Determina os tipos de dados das colunas_epi
-    """
+def obter_tipos_colunas(nome_colecao):
     try:
-        cliente = obter_cliente_mongodb_epi()
-        colecao_epi = cliente.warehouse[nome_colecao_epi]
-        doc_exemplo = colecao_epi.find_one()
+        cliente = obter_cliente_mongodb()
+        colecao = cliente.warehouse[nome_colecao]
+        doc_exemplo = colecao.find_one()
         
         if not doc_exemplo:
-            st.warning(f"Nenhum documento encontrado na coleção {nome_colecao_epi}")
             return {}
         
-        def determinar_tipo_epi(valor):
+        def determinar_tipo(valor):
             if valor is None:
                 return 'str'
-            if isinstance(valor, int):
-                return 'int64'
-            elif isinstance(valor, float):
-                return 'float64'
-            elif isinstance(valor, str):
+            if isinstance(valor, (int, float)):
+                return 'float64' if isinstance(valor, float) else 'int64'
+            if isinstance(valor, str):
                 try:
-                    int(valor.replace(',', ''))
-                    return 'int64'
+                    float(valor.replace(',', '.'))
+                    return 'float64'
                 except ValueError:
-                    try:
-                        float(valor.replace(',', '.'))
-                        return 'float64'
-                    except ValueError:
-                        return 'str'
+                    return 'str'
             return 'str'
         
-        return {k: determinar_tipo_epi(v) for k, v in doc_exemplo.items() if k != '_id'}
+        return {k: determinar_tipo(v) for k, v in doc_exemplo.items() if k != '_id'}
     except Exception as e:
-        st.error(f"Erro ao obter tipos de colunas_epi: {str(e)}")
+        st.error(f"Erro ao obter tipos de colunas: {str(e)}")
         return {}
 
-def construir_query_mongo_epi(filtros, tipos_colunas_epi):
-    """
-    Constrói a query do MongoDB baseada nos filtros aplicados
-    """
+def construir_query_mongo(filtros, tipos_colunas):
     query = {}
     
     for coluna, info_filtro in filtros.items():
@@ -336,10 +248,10 @@ def construir_query_mongo_epi(filtros, tipos_colunas_epi):
         
         if not valor_filtro:
             continue
-        
-        if tipos_colunas_epi.get(coluna, 'str') in ['int64', 'float64']:
+            
+        if tipos_colunas.get(coluna, 'str') in ['int64', 'float64']:
             try:
-                valor_numerico = converter_para_numerico_epi(valor_filtro)
+                valor_numerico = converter_para_numerico(valor_filtro)
                 if isinstance(valor_numerico, (int, float)):
                     query[coluna] = valor_numerico
                     continue
@@ -347,104 +259,90 @@ def construir_query_mongo_epi(filtros, tipos_colunas_epi):
                 pass
         
         if tipo_filtro == 'texto':
-            padrao = criar_padrao_flexivel_epi(valor_filtro)
+            padrao = criar_padrao_flexivel(valor_filtro)
             query[coluna] = {'$regex': padrao, '$options': 'i'}
         elif tipo_filtro == 'multi':
-            if valor_filtro:
-                query[coluna] = {'$in': valor_filtro}
+            query[coluna] = {'$in': valor_filtro}
     
     return query
 
-def criar_interface_filtros_epi(nome_colecao_epi, colunas_epi):
-    """
-    Cria a interface de filtros para a coleção
-    """
-    tipos_colunas_epi = obter_tipos_colunas_epi_epi(nome_colecao_epi)
+def criar_interface_filtros(nome_colecao, colunas):
+    tipos_colunas = obter_tipos_colunas(nome_colecao)
     filtros = {}
     
     with st.expander("**Filtros:**", expanded=False):
-        colunas_epi_selecionadas = st.multiselect(
+        colunas_selecionadas = st.multiselect(
             "Selecione as Colunas para filtrar:",
-            colunas_epi,
-            key=f"filter_cols_{nome_colecao_epi}"
+            colunas,
+            key=f"filter_cols_{nome_colecao}"
         )
         
-        if colunas_epi_selecionadas:
+        if colunas_selecionadas:
             cols = st.columns(2)
-            for idx, coluna in enumerate(colunas_epi_selecionadas):
+            for idx, coluna in enumerate(colunas_selecionadas):
                 with cols[idx % 2]:
                     st.markdown(f"#### {coluna}")
-                    tipo_coluna = tipos_colunas_epi.get(coluna, 'str')
+                    tipo_coluna = tipos_colunas.get(coluna, 'str')
                     tipo_filtro = st.radio(
                         "Tipo de filtro:",
                         ["Texto", "Seleção Múltipla"],
-                        key=f"radio_{nome_colecao_epi}_{coluna}",
+                        key=f"radio_{nome_colecao}_{coluna}",
                         horizontal=True
                     )
                     
                     if tipo_filtro == "Texto":
                         valor = st.text_input(
                             f"Buscar {coluna}" + (" (numérico)" if tipo_coluna in ['int64', 'float64'] else ""),
-                            key=f"text_filter_{nome_colecao_epi}_{coluna}"
+                            key=f"text_filter_{nome_colecao}_{coluna}"
                         )
                         if valor:
                             filtros[coluna] = {'tipo': 'texto', 'valor': valor}
                     else:
-                        valores_unicos = obter_valores_unicos_epi(nome_colecao_epi, coluna)
+                        valores_unicos = obter_valores_unicos(nome_colecao, coluna)
                         if valores_unicos:
                             selecionados = st.multiselect(
                                 "Selecione os valores:",
                                 options=valores_unicos,
-                                key=f"multi_filter_{nome_colecao_epi}_{coluna}"
+                                key=f"multi_filter_{nome_colecao}_{coluna}"
                             )
                             if selecionados:
                                 filtros[coluna] = {'tipo': 'multi', 'valor': selecionados}
                     
                     st.markdown("---")
     
-    return filtros, tipos_colunas_epi
+    return filtros, tipos_colunas
 
-def converter_para_pandas_epi(doc):
-    """
-    Converte um documento do MongoDB para formato compatível com Pandas
-    """
+def converter_para_pandas(doc):
     convertido = {}
     for chave, valor in doc.items():
         if isinstance(valor, ObjectId):
             convertido[chave] = str(valor)
         elif isinstance(valor, dict):
-            convertido[chave] = converter_para_pandas_epi(valor)
+            convertido[chave] = converter_para_pandas(valor)
         elif isinstance(valor, list):
             convertido[chave] = [str(item) if isinstance(item, ObjectId) else item for item in valor]
         else:
             convertido[chave] = valor
     return convertido
 
-def carregar_dados_paginados_epi(nome_colecao_epi, pagina, tamanho_pagina, filtros=None, tipos_colunas_epi=None):
-    """
-    Carrega dados paginados da coleção do MongoDB
-    """
-    if tipos_colunas_epi is None:
-        tipos_colunas_epi = obter_tipos_colunas_epi_epi(nome_colecao_epi)
+def carregar_dados_paginados(nome_colecao, pagina, tamanho_pagina, filtros=None, tipos_colunas=None):
+    if tipos_colunas is None:
+        tipos_colunas = obter_tipos_colunas(nome_colecao)
     
-    cliente = obter_cliente_mongodb_epi()
-    colecao_epi = cliente.warehouse[nome_colecao_epi]
-    query = construir_query_mongo_epi(filtros, tipos_colunas_epi) if filtros else {}
+    cliente = obter_cliente_mongodb()
+    colecao = cliente.warehouse[nome_colecao]
+    query = construir_query_mongo(filtros, tipos_colunas) if filtros else {}
     pular = (pagina - 1) * tamanho_pagina
     
     try:
-        ordenacao = [("Data Emissao", -1)] if nome_colecao_epi == 'xml' else None
-        total_filtrado = colecao_epi.count_documents(query)
+        ordenacao = [("Data Emissao", -1)] if nome_colecao == 'xml' else None
+        total_filtrado = colecao.count_documents(query)
         
-        if ordenacao:
-            try:
-                cursor = colecao_epi.find(query).sort(ordenacao).skip(pular).limit(tamanho_pagina)
-            except Exception:
-                cursor = colecao_epi.find(query).skip(pular).limit(tamanho_pagina)
-        else:
-            cursor = colecao_epi.find(query).skip(pular).limit(tamanho_pagina)
+        cursor = (colecao.find(query)
+                 .sort(ordenacao) if ordenacao else colecao.find(query))
+        cursor = cursor.skip(pular).limit(tamanho_pagina)
         
-        documentos = [converter_para_pandas_epi(doc) for doc in cursor]
+        documentos = [converter_para_pandas(doc) for doc in cursor]
         df = pd.DataFrame(documentos)
         
         return df, total_filtrado
@@ -452,10 +350,7 @@ def carregar_dados_paginados_epi(nome_colecao_epi, pagina, tamanho_pagina, filtr
         st.error(f"Erro ao carregar dados: {str(e)}")
         return pd.DataFrame(), 0
 
-def processar_urls_epi(urls):
-    """
-    Processa URLs de imagens para exibição
-    """
+def processar_urls(urls):
     if isinstance(urls, pd.Series):
         urls = urls.iloc[0]
     if urls is None or (isinstance(urls, float) and math.isnan(urls)):
@@ -467,56 +362,49 @@ def processar_urls_epi(urls):
         return urls_validas[0] if urls_validas else None
     return None
 
-def formatar_valor_epi(valor):
-    """
-    Formata valores para exibição nos cartões
-    """
+def formatar_valor(valor):
     if isinstance(valor, pd.Series):
         valor = valor.iloc[0]
     if pd.isna(valor):
         return '-'
     if isinstance(valor, (int, float)):
+        # Remove decimal places if value is a whole number
         if float(valor).is_integer():
-            return f'{int(valor):,}'.replace(',', '.')
+            return f'{int(valor):,}'.replace(',', '')
         return f'{valor:.2f}'.replace('.', ',')
     if isinstance(valor, str):
         valor_limpo = valor.strip().replace(',', '.')
         try:
             valor_num = float(valor_limpo)
             if float(valor_num).is_integer():
-                return f'{int(valor_num):,}'.replace(',', '.')
+                return f'{int(valor_num):,}'.replace(',', '')
             return f'{valor_num:.2f}'.replace('.', ',')
         except ValueError:
-            return str(valor)[:35]
-    return str(valor)[:35]
+            return str(valor)[:45]
+    return str(valor)[:45]
 
-def renderizar_cartoes_epi(df, colunas_epi_visiveis, nome_colecao_epi):
-    """
-    Renderiza os cartões de dados na interface
-    """
-    gerenciador = GerenciadorCartoes(nome_colecao_epi)
-    colunas_epi_imagem = [col for col in df.columns if 'url_imagens' in col.lower()]
-    num_colunas_epi = 5
-    linhas = [df.iloc[i:i+num_colunas_epi] for i in range(0, len(df), num_colunas_epi)]
+def renderizar_cartoes(df, colunas_visiveis, nome_colecao):
+    colunas_imagem = [col for col in df.columns if 'url_imagens' in col.lower()]
+    num_colunas = 5
+    linhas = [df.iloc[i:i+num_colunas] for i in range(0, len(df), num_colunas)]
     
     for idx_linha, linha in enumerate(linhas):
-        cols = st.columns(num_colunas_epi)
+        cols = st.columns(num_colunas)
         
         for idx_col, (_, registro) in enumerate(linha.iterrows()):
             with cols[idx_col]:
                 url_imagem = None
-                for col_img in colunas_epi_imagem:
+                for col_img in colunas_imagem:
                     if col_img in registro:
-                        url_imagem = processar_urls_epi(registro[col_img])
+                        url_imagem = processar_urls(registro[col_img])
                         if url_imagem:
                             break
-                #Selecione as colunas_epi para filtrar
-                # Conteúdo do Cartão
+
                 detalhes_cartao = ''.join([
                     f'<div style="margin-bottom: 4px; font-size: 0.8rem;">'
-                    f'<strong>{col}:</strong> {formatar_valor_epi(registro.get(col, "-"))}</div>'
-                    for col in colunas_epi_visiveis 
-                    if col not in colunas_epi_imagem and col != '_id'
+                    f'<strong>{col}:</strong> {formatar_valor(registro.get(col, "-"))}</div>'
+                    for col in colunas_visiveis 
+                    if col not in colunas_imagem and col != '_id'
                 ])
                 
                 estilo_cartao = (
@@ -551,113 +439,94 @@ def renderizar_cartoes_epi(df, colunas_epi_visiveis, nome_colecao_epi):
                 # Botões de ação
                 col1, col2 = st.columns(2)
                 with col1:
-                    if st.button(
-                        "✏️ Editar",
-                        key=f"edit_btn_{nome_colecao_epi}_{registro['_id']}",
-                        use_container_width=True
-                    ):
-                        st.session_state.cartoes_edicao.add(str(registro['_id']))
+                    if st.button("✏️ Editar", key=f"edit_btn_{nome_colecao}_{registro['_id']}", use_container_width=True):
+                        dialog_edicao(nome_colecao, registro, colunas_visiveis)
                 with col2:
-                    if st.button(
-                        "🗑️ Excluir",
-                        key=f"delete_btn_{nome_colecao_epi}_{registro['_id']}",
-                        use_container_width=True
-                    ):
-                        st.session_state.cartoes_exclusao.add(str(registro['_id']))
-                
-                # Modais
-                id_cartao = str(registro['_id'])
-                if id_cartao in st.session_state.cartoes_edicao:
-                    gerenciador.renderizar_modal_edicao_epi(id_cartao, registro, colunas_epi_visiveis + ['_id'], colunas_epi_imagem)
-                if id_cartao in st.session_state.cartoes_exclusao:
-                    gerenciador.renderizar_modal_exclusao_epi(id_cartao)
+                    if st.button("🗑️ Excluir", key=f"delete_btn_{nome_colecao}_{registro['_id']}", use_container_width=True):
+                        dialog_exclusao(nome_colecao, registro)
 
-def exibir_pagina_dados_epi(nome_colecao_epi):
-    """
-    Exibe a página principal_epi de dados para uma coleção
-    """
-    total_documentos, colunas_epi, padrao_visiveis = obter_colunas_epi_colecao_epi_epi(nome_colecao_epi)
-    
-    colunas_epi = [col for col in colunas_epi if col != '_id']
-    padrao_visiveis = [col for col in padrao_visiveis if col != '_id']
+def exibir_pagina_dados(nome_colecao):
+    total_documentos, colunas, padrao_visiveis = obter_colunas_colecao(nome_colecao)
     
     if total_documentos == 0:
-        st.error(f"Nenhum documento encontrado na coleção {nome_colecao_epi}")
+        st.error(f"Nenhum documento encontrado na coleção {nome_colecao}")
         return
 
     with st.expander("**Colunas Visíveis:**", expanded=False):
-        chave_estado = f'colunas_epi_visiveis_{nome_colecao_epi}'
+        chave_estado = f'colunas_visiveis_{nome_colecao}'
         if chave_estado not in st.session_state:
             st.session_state[chave_estado] = padrao_visiveis
-            
-        colunas_epi_visiveis = st.multiselect(
-            "Selecione as Colunas para exibir:",
-            options=colunas_epi,
-            default=st.session_state[chave_estado],
-            key=f'seletor_colunas_epi_{nome_colecao_epi}'
-        )
-        st.session_state[chave_estado] = colunas_epi_visiveis
         
-        if st.button("Mostrar Todas as Colunas", key=f"mostrar_todas_{nome_colecao_epi}"):
-            st.session_state[chave_estado] = colunas_epi
-            st.rerun()
+        # Create columns for the multiselect and new button
+        col_multiselect, col_button = st.columns([0.8, 0.2])
+        
+        with col_multiselect:
+            colunas_visiveis = st.multiselect(
+                "Selecione as Colunas para exibir:",
+                options=colunas,
+                default=st.session_state[chave_estado],
+                key=f'seletor_colunas_{nome_colecao}'
+            )
+        
+        # Add button to show all columns
+        with col_button:
+            if st.button("Mostrar Todas", key=f'mostrar_todas_{nome_colecao}', use_container_width=True):
+                st.session_state[chave_estado] = colunas
+                colunas_visiveis = colunas
+                st.rerun()
+        
+        st.session_state[chave_estado] = colunas_visiveis
 
-    filtros, tipos_colunas_epi = criar_interface_filtros_epi(nome_colecao_epi, colunas_epi)
+    filtros, tipos_colunas = criar_interface_filtros(nome_colecao, colunas)
     
     with st.expander("**Configurações:**", expanded=False):
-        col1, col2, col3 = st.columns([1,1,1], gap='small')
+        col1, col2, col3 = st.columns([1,1,1])
         
         with col1:
-            c1, c2 = st.columns([2, 1])
-            c1.write('Registros por página:')
-            tamanho_pagina = c2.selectbox(
+            tamanho_pagina = st.selectbox(
                 "Registros por página:",
                 options=[10, 25, 50, 100],
                 index=1,
-                key=f"tamanho_pagina_{nome_colecao_epi}",
-                label_visibility='collapsed'
+                key=f"tamanho_pagina_{nome_colecao}"
             )
         
-        chave_pagina = f'pagina_{nome_colecao_epi}'
+        chave_pagina = f'pagina_{nome_colecao}'
         if chave_pagina not in st.session_state:
             st.session_state[chave_pagina] = 1
-        pagina_atual = st.session_state[chave_pagina]
-        
-        df, total_filtrado = carregar_dados_paginados_epi(
-            nome_colecao_epi,
-            pagina_atual,
+            
+        df, total_filtrado = carregar_dados_paginados(
+            nome_colecao,
+            st.session_state[chave_pagina],
             tamanho_pagina,
             filtros,
-            tipos_colunas_epi
+            tipos_colunas
         )
         
-        if not df.empty and colunas_epi_visiveis:
-            df = df[colunas_epi_visiveis + ['_id']]
-        
         total_paginas = math.ceil(total_filtrado / tamanho_pagina) if total_filtrado > 0 else 1
-        pagina_atual = min(pagina_atual, total_paginas)
+        st.session_state[chave_pagina] = min(st.session_state[chave_pagina], total_paginas)
         
         with col2:
-            st.write(f"Total: {total_filtrado} registros | Página {pagina_atual} de {total_paginas}")
+            st.write(f"Total: {total_filtrado} registros | Página {st.session_state[chave_pagina]} de {total_paginas}")
         
         with col3:
-            cols = st.columns(4)
-            navegacao = {
-                "⏪": lambda: st.session_state.update({chave_pagina: 1}),
-                "◀️": lambda: st.session_state.update({chave_pagina: max(1, pagina_atual - 1)}),
-                "▶️": lambda: st.session_state.update({chave_pagina: min(total_paginas, pagina_atual + 1)}),
-                "⏩": lambda: st.session_state.update({chave_pagina: total_paginas})
-            }
-            
-            for idx, (texto, callback) in enumerate(navegacao.items()):
-                if cols[idx].button(texto, key=f"{texto}_{nome_colecao_epi}"):
-                    callback()
-                    st.rerun()
+            cols_nav = st.columns(4)
+            if cols_nav[0].button("⏪", key=f"first_{nome_colecao}"):
+                st.session_state[chave_pagina] = 1
+                st.rerun()
+            if cols_nav[1].button("◀️", key=f"prev_{nome_colecao}"):
+                st.session_state[chave_pagina] = max(1, st.session_state[chave_pagina] - 1)
+                st.rerun()
+            if cols_nav[2].button("▶️", key=f"next_{nome_colecao}"):
+                st.session_state[chave_pagina] = min(total_paginas, st.session_state[chave_pagina] + 1)
+                st.rerun()
+            if cols_nav[3].button("⏩", key=f"last_{nome_colecao}"):
+                st.session_state[chave_pagina] = total_paginas
+                st.rerun()
 
-    if not df.empty:
-        renderizar_cartoes_epi(df, colunas_epi_visiveis, nome_colecao_epi)
+    if not df.empty and colunas_visiveis:
+        renderizar_cartoes(df[colunas_visiveis + ['_id']], colunas_visiveis, nome_colecao)
         
-        if st.button("📥 Baixar dados filtrados", key=f"download_{nome_colecao_epi}"):
+        if st.button("📥 Baixar dados filtrados", key=f"download_{nome_colecao}"):
             texto_progresso = "Preparando download..."
             barra_progresso = st.progress(0, text=texto_progresso)
             
@@ -669,9 +538,9 @@ def exibir_pagina_dados_epi(nome_colecao_epi):
                 progresso = pagina / total_paginas_download
                 barra_progresso.progress(progresso, text=f"{texto_progresso} ({pagina}/{total_paginas_download})")
                 
-                df_pagina, _ = carregar_dados_paginados_epi(nome_colecao_epi, pagina, tamanho_lote, filtros)
-                if colunas_epi_visiveis:
-                    df_pagina = df_pagina[colunas_epi_visiveis]
+                df_pagina, _ = carregar_dados_paginados(nome_colecao, pagina, tamanho_lote, filtros)
+                if colunas_visiveis:
+                    df_pagina = df_pagina[colunas_visiveis]
                 todos_dados.append(df_pagina)
             
             df_completo = pd.concat(todos_dados, ignore_index=True)
@@ -683,7 +552,7 @@ def exibir_pagina_dados_epi(nome_colecao_epi):
             st.download_button(
                 label="💾 Clique para baixar Excel",
                 data=buffer.getvalue(),
-                file_name=f'{nome_colecao_epi}_dados.xlsx',
+                file_name=f'{nome_colecao}_dados.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
             
@@ -691,34 +560,27 @@ def exibir_pagina_dados_epi(nome_colecao_epi):
     else:
         st.warning("Nenhum dado encontrado com os filtros aplicados")
 
-def initialize_session_state_epi():
-    """Initialize session state variables"""
+def initialize_session_state():
     if 'user' not in st.session_state:
-        st.session_state.user = {
-            st.switch_page("app.py")      
-        }
+        st.session_state.user = {}
+        st.switch_page("app.py")
 
-
-
-
-def principal_epi():
+def principal():
     st.set_page_config(
         page_title="Home Admin",
         page_icon="📊",
         layout="wide",
-        initial_sidebar_state="collapsed"       
+        initial_sidebar_state="collapsed"
     )
-    # Initialize session state
-    initialize_session_state_epi()
+    
+    initialize_session_state()
 
-    with st.sidebar:    
-        # Get user info from session state
+    with st.sidebar:
         user = st.session_state.user
-        name = user.get('name',)
+        name = user.get('name', '')
         email = user.get('email', '')
         phone = user.get('phone', '')
         
-        # Create a container for user info with custom styling
         st.markdown(
             f"""
             <div style='
@@ -727,24 +589,21 @@ def principal_epi():
                 background-color: #f0f2f6;
                 margin-bottom: 1rem;
             '>
-                <div style='font-size: 1.1rem; font-weight: bold; margin-bottom: 0.5rem;                 display: flex;
-                justify-content: center;'>
+                <div style='font-size: 1.1rem; font-weight: bold; margin-bottom: 0.5rem; display: flex; justify-content: center;'>
                     {name}
                 </div>
-                <div style='font-size: 0.9rem; color: #666;                display: flex;
-                justify-content: center;'>
-                     {email}  
+                <div style='font-size: 0.9rem; color: #666; display: flex; justify-content: center;'>
+                    {email}
                 </div>
-                <div style='font-size: 0.9rem; color: #666;                display: flex;
-                justify-content: center;'>
-                     {phone}  
+                <div style='font-size: 0.9rem; color: #666; display: flex; justify-content: center;'>
+                    {phone}
                 </div>
             </div>
             """,
             unsafe_allow_html=True
         )
-    # Enhanced initials display with gradient background
-        initials = st.session_state.user['initials']
+        
+        initials = st.session_state.user.get('initials', '')
         st.markdown(
             f"""
             <div style='display: flex; justify-content: center; margin-bottom: 1.5rem;'>
@@ -771,36 +630,24 @@ def principal_epi():
             unsafe_allow_html=True
         )
         
-        # Add the logout button
-        if st.button(
-            "Logout",
-            key="logout_button",
-            type="primary",
-            use_container_width=True
-        ):
-            # Limpar todos os estados da sessão
+        if st.button("Logout", key="logout_button", type="primary", use_container_width=True):
             for key in st.session_state.keys():
                 del st.session_state[key]
-            
-            # Redirecionar para a página inicial
             st.switch_page("app.py")
 
     col1, col2 = st.columns([3, 1], gap="large")
-
-    # Coluna 1
     with col1:
         st.markdown('## **📊 :rainbow[Home Epi]**')
 
-    colecoes = ['reqepi','xml', 'nfspdf', 'po']
-    #colecoes = ['reqepi','xml', 'nfspdf', 'po']
-    abas = st.tabs([colecao_epi.upper() for colecao_epi in colecoes])
+    colecoes = ['reqepi', 'xml', 'nfspdf', 'po']
+    abas = st.tabs([colecao.upper() for colecao in colecoes])
     
-    for aba, nome_colecao_epi in zip(abas, colecoes):
+    for aba, nome_colecao in zip(abas, colecoes):
         with aba:
-            exibir_pagina_dados_epi(nome_colecao_epi)
+            exibir_pagina_dados(nome_colecao)
     
     st.divider()
     st.caption("Dashboard de Dados MongoDB v1.0")
 
 if __name__ == "__main__":
-    principal_epi()
+    principal()

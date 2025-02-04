@@ -137,6 +137,7 @@ def clean_dataframe(df):
     
     # Adiciona 'creation_date' automaticamente com o timestamp UTC e timezone-aware
     df_clean['creation_date'] = datetime.now(timezone.utc)
+    df_clean['observation'] = ""
     
     for column in df_clean.columns:
         if pd.api.types.is_datetime64_any_dtype(df_clean[column]):

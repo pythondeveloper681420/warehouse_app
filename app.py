@@ -438,10 +438,12 @@ class WarehouseApp:
             self.render_login_page()
         else:
             current_path = st.query_params.get("page", "")
-            if current_path != "00_home":
-                st.switch_page("pages/00_home.py")
+            # if current_path != "00_home":
+            #     st.switch_page("pages/00_home.py")
             # if current_path != "06_editavel":
             #     st.switch_page("pages/06_editavel.py")
+            if current_path != "01_epi_control":
+                st.switch_page("pages/01_epi_control.py")
 def main():
     WarehouseApp().run()
 

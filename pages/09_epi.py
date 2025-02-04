@@ -114,7 +114,8 @@ def main():
     st.set_page_config(
         page_title="Processador de Requisições EPI",
         page_icon="📊",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="collapsed"
     )
 
     # CSS personalizado
@@ -137,8 +138,8 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    # Título principal
     st.title("📊 Processador de Requisições EPI")
+
 
     # Criação das abas
     tab1, tab2, tab3 = st.tabs([
@@ -150,6 +151,10 @@ def main():
     # Variáveis de estado para compartilhar dados entre as abas
     if 'processed_df' not in st.session_state:
         st.session_state.processed_df = None
+    
+    # Initialize selected_month in session state if not present
+    if 'selected_month' not in st.session_state:
+        st.session_state.selected_month = 'Todos'
 
     # Aba de Processamento
     with tab1:
@@ -190,7 +195,41 @@ def main():
                                 ]
 
                             df_principal['Data'] = df_principal['Data'].dt.strftime('%d/%m/%Y')
-                            
+
+                            renomear_colunas = {
+                                'url_imagens': 'url_imagens',
+                                'Item': 'Item',
+                                'Cod. Material': 'Código Material',
+                                'Descrição': 'Descrição Material',
+                                'Cod. Material Atendido': 'Código Material Atendido',
+                                'Descrição Material Atendido': 'Descrição Material Atendido',
+                                'Qtd. Solicitada': 'Quantidade Solicitada',
+                                'Qtd. Atendida': 'Quantidade Atendida',
+                                'Unid.': 'Unidade',
+                                'Valor': 'Valor Unitário',
+                                'Valor Total': 'Valor Total',
+                                'Requisição': 'Número Requisição',
+                                'Solicitante': 'Nome Solicitante',
+                                'Chave NF-e': 'Chave Nota Fiscal',
+                                'Data': 'Data Solicitação',
+                                'CC - WBS': 'Centro de Custo - WBS',
+                                'Obra - Setor': 'Obra / Setor',
+                                'ID_Solicitante': 'ID Solicitante',
+                                'Status': 'Status Requisição',
+                                'Nome do Arquivo': 'Nome Arquivo',
+                                'Mes_Numero': 'Número Mês',
+                                'Mes': 'Mês',
+                                'Ano': 'Ano',
+                                #'Dia': 'Dia',
+                                'Mes/Ano': 'Mês/Ano',
+                                'req_cod': 'Código Requisição',
+                                'unique': 'unique'
+
+                            }
+
+                            # Aplicar a renomeação
+                            df_principal = df_principal.rename(columns=renomear_colunas)                            
+    
                             randon = datetime.now().strftime("%d%m%Y%H%M%S") + str(datetime.now().microsecond)[:3]
                             output_path = os.path.join(get_downloads_folder(), f'REQS_EPI_{randon}.xlsx')
                             df_principal.to_excel(output_path, index=False)
@@ -207,24 +246,24 @@ def main():
             
             with col1:
                 st.subheader("Filtros")
-                if 'Mes/Ano' in st.session_state.processed_df.columns:
-                    selected_month = st.selectbox(
+                if 'Mês/Ano' in st.session_state.processed_df.columns:
+                    st.session_state.selected_month = st.selectbox(
                         "Selecione o Mês/Ano",
-                        options=['Todos'] + list(st.session_state.processed_df['Mes/Ano'].unique())
+                        options=['Todos'] + list(st.session_state.processed_df['Mês/Ano'].unique()),
+                        key='month_selector'
                     )
             
             with col2:
                 st.subheader("Dados Processados")
                 filtered_df = st.session_state.processed_df
-                if selected_month != 'Todos':
-                    filtered_df = filtered_df[filtered_df['Mes/Ano'] == selected_month]
+                if st.session_state.selected_month != 'Todos':
+                    filtered_df = filtered_df[filtered_df['Mês/Ano'] == st.session_state.selected_month]
                 
                 st.dataframe(
                     filtered_df,
                     use_container_width=True,
                     height=400
-                )
-            
+                )           
             # # Análises e gráficos
             # st.subheader("Análises")
             # col3, col4 = st.columns(2)
@@ -296,3 +335,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    #selected_month

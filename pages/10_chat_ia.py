@@ -3,8 +3,14 @@ from google.generativeai import configure, GenerativeModel
 import google.generativeai as genai
 import time
 
-# Configuração da página Streamlit
-st.set_page_config(page_title="Chatbot com Streamlit e Google AI", layout="wide")
+# Page configuration
+st.set_page_config(
+    page_title="Chatbot com Streamlit e Google AI",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
 
 # Configuração da API do Google (use st.secrets para manter a chave segura)
 configure(api_key=st.secrets["GOOGLE_API_KEY"])
@@ -30,7 +36,8 @@ def gerar_resposta(prompt):
     except Exception as e:
         return f"Erro ao gerar resposta: {str(e)}"
 
-st.title("Chatbot com Streamlit e Google AI")
+
+st.markdown('## **🤖 :rainbow[Chatbot com Google AI]**')
 
 # Usando um container para o chat
 chat_container = st.container()

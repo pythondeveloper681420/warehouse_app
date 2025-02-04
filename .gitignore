@@ -126,6 +126,7 @@ celerybeat.pid
 
 # Environments
 #.streamlit
+.devcontainer
 .streamlit
 .env
 .venv
