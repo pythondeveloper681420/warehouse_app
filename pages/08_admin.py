@@ -101,8 +101,12 @@ def process_and_save_excel():
         # Mostrar quantidade inicial de registros
         st.info(f"Total de registros antes do processamento: {len(df)}")
        
-        # Processar duplicatas
-        with st.spinner("Processando duplicatas..."):
+        # Processar duplicatas e remover espaços em branco das tags
+        with st.spinner("Processando duplicatas e limpando tags..."):
+            # Remover espaços em branco do início e fim das tags
+            df['tags'] = df['tags'].str.strip()
+            
+            # Encontrar e remover duplicatas
             duplicates = df[df.duplicated(subset=['tags'], keep=False)]
             num_duplicates = len(duplicates)
             df_tags = df.drop_duplicates(subset=['tags'], keep='first')
