@@ -110,7 +110,9 @@ FIELD_MAPPINGS = {
     "valor_servico": [
         r"Valor (do|dos) Serviço(s)?\s*R\$\s*([\d\.,]+)",
         r"Valor Total\s*R\$\s*([\d\.,]+)",
-        r"Total da Nota\s*R\$\s*([\d\.,]+)"
+        r"Total da Nota\s*R\$\s*([\d\.,]+)",
+        r"Valor do Serviço\s*[\r\n]+\s*([\d\.,]+)",  # New pattern for your PDF format
+        r"Valor do Serviço\s*([\d\.,]+)"  # Alternative pattern without newline
     ],
     "desconto_incondicionado": [
         r"Desconto Incondicionado\s*R\$\s*([\d\.,]+)",
