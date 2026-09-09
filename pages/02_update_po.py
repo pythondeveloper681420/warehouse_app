@@ -23,6 +23,12 @@ MAX_UPLOAD_SIZE_MB = 200
 BYTES_PER_MB = 1024 * 1024
 CHUNK_SIZE = 10000
 
+# Colunas numéricas que o processamento precisa (serão criadas com 0 se ausentes)
+REQUIRED_NUMERIC_COLUMNS = ['Net order value', 'Order Quantity', 'PBXX Condition Amount']
+
+# Colunas sem as quais não é possível identificar um item de PO de forma única
+CRITICAL_COLUMNS = ['Purchasing Document', 'Item']
+
 # Colunas selecionadas para salvar no arquivo final
 SELECTED_COLUMNS = [
     'Purchasing Document',
@@ -103,16 +109,32 @@ class DataProcessor:
             return 0
 
     @staticmethod
+    def ensure_numeric_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+        """
+        Garante que as colunas numéricas necessárias existam no DataFrame.
+        Se uma coluna estiver ausente, ela é criada com valor 0 e um aviso é
+        registrado, evitando que o processamento quebre com KeyError.
+        """
+        for col in columns:
+            if col not in df.columns:
+                logger.warning(
+                    f"Coluna '{col}' não encontrada no arquivo enviado. "
+                    f"Criando a coluna com valor 0 para permitir o processamento."
+                )
+                df[col] = 0
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        return df
+
+    @staticmethod
     def process_chunk(df: pd.DataFrame) -> pd.DataFrame:
         """Process a chunk of data"""
         try:
             chunk_processed = df.copy()
 
-            numeric_columns = ['Net order value', 'Order Quantity', 'PBXX Condition Amount']
-            for col in numeric_columns:
-                if col in chunk_processed.columns:
-                    chunk_processed[col] = pd.to_numeric(chunk_processed[col], errors='coerce')
-                    chunk_processed[col] = chunk_processed[col].fillna(0)
+            # Garante que as colunas numéricas necessárias existam antes de usá-las
+            chunk_processed = DataProcessor.ensure_numeric_columns(
+                chunk_processed, REQUIRED_NUMERIC_COLUMNS
+            )
 
             chunk_processed['valor_unitario'] = chunk_processed.apply(
                 lambda row: DataProcessor.safe_division(row['Net order value'], row['Order Quantity']),
@@ -130,9 +152,27 @@ class DataProcessor:
             raise
 
     @staticmethod
+    def validate_critical_columns(df: pd.DataFrame) -> None:
+        """
+        Verifica se as colunas indispensáveis para o processamento estão
+        presentes. Se não estiverem, lança um erro com mensagem clara em vez
+        de deixar o pandas lançar um KeyError genérico mais adiante.
+        """
+        missing = [col for col in CRITICAL_COLUMNS if col not in df.columns]
+        if missing:
+            raise ValueError(
+                "O arquivo enviado não contém a(s) coluna(s) obrigatória(s): "
+                f"{', '.join(missing)}. Verifique se o arquivo exportado do SAP "
+                "possui essas colunas e tente novamente."
+            )
+
+    @staticmethod
     def process_dataframe(df: pd.DataFrame, progress_bar: Any) -> pd.DataFrame:
         """Process the complete DataFrame with progress tracking"""
         try:
+            # Validação inicial das colunas críticas (falha rápido com mensagem clara)
+            DataProcessor.validate_critical_columns(df)
+
             chunk_size = CHUNK_SIZE
             num_chunks = len(df) // chunk_size + 1
             processed_chunks = []
@@ -172,8 +212,15 @@ class DataProcessor:
             df_processed['total_valor_po_com_impostos'] = df_processed.groupby(groupby_cols)['valor_item_com_impostos'].transform('sum')
             df_processed['total_itens_po'] = df_processed.groupby(groupby_cols)['Order Quantity'].transform('sum')
 
-            df_processed['PO Creation Date'] = pd.to_datetime(df_processed['Document Date'], dayfirst=True)
-            df_processed = df_processed.sort_values(by='PO Creation Date', ascending=False)
+            # Coluna de data — cria PO Creation Date apenas se 'Document Date' existir
+            if 'Document Date' in df_processed.columns:
+                df_processed['PO Creation Date'] = pd.to_datetime(
+                    df_processed['Document Date'], dayfirst=True, errors='coerce'
+                )
+                df_processed = df_processed.sort_values(by='PO Creation Date', ascending=False)
+            else:
+                logger.warning("Coluna 'Document Date' não encontrada. 'PO Creation Date' ficará vazia.")
+                df_processed['PO Creation Date'] = pd.NaT
 
             currency_columns = [
                 'valor_unitario', 'valor_item_com_impostos', 'Net order value',
@@ -252,7 +299,12 @@ class FileHandler:
     def read_excel_file(file: Any) -> Optional[pd.DataFrame]:
         """Safely read Excel file"""
         try:
-            return pd.read_excel(file, engine='openpyxl')
+            df = pd.read_excel(file, engine='openpyxl')
+            # Normaliza os nomes das colunas (remove espaços extras nas pontas)
+            # para evitar erros de "coluna não encontrada" causados por
+            # diferenças invisíveis de formatação no cabeçalho do Excel.
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
         except Exception as e:
             logger.error(f"Error reading file {file.name}: {str(e)}")
             return None
