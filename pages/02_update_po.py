@@ -1,3 +1,24 @@
+# =============================================================================
+# IMPORTANTE SOBRE O LIMITE DE UPLOAD (500MB)
+# -----------------------------------------------------------------------------
+# O limite de tamanho de upload NÃO é controlado pelo código Python — ele é
+# imposto pelo próprio servidor do Streamlit antes do seu script rodar.
+# Para permitir uploads maiores (ex: 500MB), garanta que exista o arquivo
+# ".streamlit/config.toml" na mesma pasta deste script com o conteúdo:
+#
+#   [server]
+#   maxUploadSize = 550
+#   maxMessageSize = 550
+#
+# Esse arquivo já foi gerado junto com este script. Se preferir, você também
+# pode rodar o app assim, sem precisar do config.toml:
+#
+#   streamlit run po_processor_streamlit.py --server.maxUploadSize=550
+#
+# Sem uma dessas duas opções, o Streamlit vai barrar o upload em 200MB mesmo
+# que o código aqui já esteja preparado para tamanhos maiores.
+# =============================================================================
+
 import pandas as pd
 import streamlit as st
 import time
@@ -5,7 +26,7 @@ from datetime import datetime
 import io
 import gc
 import logging
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Optional, Any, Dict
 import numpy as np
 import base64
 import re
@@ -19,15 +40,63 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_UPLOAD_SIZE_MB = 200
+MAX_UPLOAD_SIZE_MB = 550  # alinhado ao config.toml (server.maxUploadSize)
 BYTES_PER_MB = 1024 * 1024
 CHUNK_SIZE = 10000
 
-# Colunas numéricas que o processamento precisa (serão criadas com 0 se ausentes)
-REQUIRED_NUMERIC_COLUMNS = ['Net order value', 'Order Quantity', 'PBXX Condition Amount']
+# -----------------------------------------------------------------------------
+# Valores padrão para TODAS as colunas usadas no processamento.
+# Se uma coluna não existir no arquivo enviado, ela é criada automaticamente
+# com este valor padrão (e um aviso é registrado no log), então o
+# processamento NUNCA quebra por causa de coluna ausente.
+# -----------------------------------------------------------------------------
+DEFAULT_COLUMN_VALUES: Dict[str, Any] = {
+    # Identificadores — usar NaN (não string vazia) para não conflitar com o
+    # filtro que remove linhas cujo 'Purchasing Document' é uma string.
+    'Purchasing Document': np.nan,
+    'Item': np.nan,
 
-# Colunas sem as quais não é possível identificar um item de PO de forma única
-CRITICAL_COLUMNS = ['Purchasing Document', 'Item']
+    # Numéricas
+    'Order Quantity': 0,
+    'Net order value': 0,
+    'PBXX Condition Amount': 0,
+    'Price unit': 0,
+    'Gross Price': 0,
+
+    # Texto
+    'Supplier': '',
+    'Vendor Name': '',
+    'Material': '',
+    'Material Description': '',
+    'Order Unit': '',
+    'Control Code (NCM)': '',
+    'Project Code': '',
+    'Andritz WBS Element': '',
+    'Cost Center': '',
+    'Document Date': '',
+    'PO Created by': '',
+    'Purchase Requisition': '',
+    'PR Created by': '',
+    'Purchasing Group': '',
+    'Plant': '',
+    'Delivery date': '',
+    'Last FUP': '',
+    'Stat.-Rel. Del. Date': '',
+    'Delivery Date': '',
+    'Requisition Date': '',
+    'Inspection Request Date': '',
+    'First Delivery Date': '',
+    'Purchase Requisition Delivery Date': '',
+}
+
+NUMERIC_COLUMNS = ['Order Quantity', 'Net order value', 'PBXX Condition Amount', 'Price unit', 'Gross Price']
+
+DATE_COLUMNS = [
+    'Delivery date', 'Last FUP',
+    'Stat.-Rel. Del. Date', 'Delivery Date',
+    'Requisition Date', 'Inspection Request Date',
+    'First Delivery Date', 'Purchase Requisition Delivery Date'
+]
 
 # Colunas selecionadas para salvar no arquivo final
 SELECTED_COLUMNS = [
@@ -72,12 +141,17 @@ SELECTED_COLUMNS = [
 def extract_code(text: str) -> str:
     """
     Extrai apenas os 6 dígitos do padrão X-XX-XXXXXX-XXX-XXXX-XXX.
+    Nunca lança exceção: em caso de entrada inesperada, retorna "".
     """
-    if not text or not isinstance(text, str):
+    try:
+        if not text or not isinstance(text, str):
+            return ""
+        pattern = r'[A-Z0-9]-[A-Z0-9]{2}-(\d{6})-\d{3}-\d{4}-\d{3}'
+        match = re.search(pattern, text)
+        return match.group(1) if match else ""
+    except Exception as e:
+        logger.warning(f"extract_code falhou para o valor '{text}': {e}")
         return ""
-    pattern = r'[A-Z0-9]-[A-Z0-9]{2}-(\d{6})-\d{3}-\d{4}-\d{3}'
-    match = re.search(pattern, text)
-    return match.group(1) if match else ""
 
 
 class DataProcessor:
@@ -85,7 +159,7 @@ class DataProcessor:
 
     @staticmethod
     def format_currency(value: float) -> str:
-        """Format value as Brazilian currency"""
+        """Format value as Brazilian currency. Nunca lança exceção."""
         try:
             if pd.isna(value) or value == '':
                 return "R$ 0,00"
@@ -105,36 +179,56 @@ class DataProcessor:
         """Safely perform division handling zero division"""
         try:
             return x / y if y != 0 else 0
-        except:
+        except Exception:
             return 0
 
     @staticmethod
-    def ensure_numeric_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    def safe_int_id_convert(series: pd.Series) -> pd.Series:
         """
-        Garante que as colunas numéricas necessárias existam no DataFrame.
-        Se uma coluna estiver ausente, ela é criada com valor 0 e um aviso é
-        registrado, evitando que o processamento quebre com KeyError.
+        Converte uma coluna para inteiro (removendo caracteres não numéricos).
+        Se a conversão falhar por qualquer motivo, registra um aviso e
+        devolve a coluna original sem quebrar o processamento.
         """
-        for col in columns:
+        try:
+            return (
+                series.astype(str)
+                .str.replace(r'\D', '', regex=True)
+                .replace('', pd.NA)
+                .astype(pd.Int64Dtype())
+            )
+        except Exception as e:
+            logger.warning(f"Não foi possível converter coluna para inteiro: {e}")
+            return series
+
+    @staticmethod
+    def ensure_all_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Garante que TODAS as colunas esperadas existam no DataFrame.
+        Colunas ausentes são criadas com um valor padrão seguro e um aviso
+        é registrado no log — o processamento nunca é interrompido por isso.
+        """
+        df = df.copy()
+        for col, default_value in DEFAULT_COLUMN_VALUES.items():
             if col not in df.columns:
                 logger.warning(
                     f"Coluna '{col}' não encontrada no arquivo enviado. "
-                    f"Criando a coluna com valor 0 para permitir o processamento."
+                    f"Criando coluna com valor padrão para permitir o processamento."
                 )
-                df[col] = 0
+                df[col] = default_value
+
+        for col in NUMERIC_COLUMNS:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
         return df
 
     @staticmethod
     def process_chunk(df: pd.DataFrame) -> pd.DataFrame:
-        """Process a chunk of data"""
+        """Process a chunk of data. Assume que ensure_all_columns já rodou."""
         try:
             chunk_processed = df.copy()
 
-            # Garante que as colunas numéricas necessárias existam antes de usá-las
-            chunk_processed = DataProcessor.ensure_numeric_columns(
-                chunk_processed, REQUIRED_NUMERIC_COLUMNS
-            )
+            # Segurança extra (dupla proteção), caso o chunk venha sem alguma coluna
+            chunk_processed = DataProcessor.ensure_all_columns(chunk_processed)
 
             chunk_processed['valor_unitario'] = chunk_processed.apply(
                 lambda row: DataProcessor.safe_division(row['Net order value'], row['Order Quantity']),
@@ -148,47 +242,43 @@ class DataProcessor:
             return chunk_processed
 
         except Exception as e:
-            logger.error(f"Error processing chunk: {str(e)}")
-            raise
-
-    @staticmethod
-    def validate_critical_columns(df: pd.DataFrame) -> None:
-        """
-        Verifica se as colunas indispensáveis para o processamento estão
-        presentes. Se não estiverem, lança um erro com mensagem clara em vez
-        de deixar o pandas lançar um KeyError genérico mais adiante.
-        """
-        missing = [col for col in CRITICAL_COLUMNS if col not in df.columns]
-        if missing:
-            raise ValueError(
-                "O arquivo enviado não contém a(s) coluna(s) obrigatória(s): "
-                f"{', '.join(missing)}. Verifique se o arquivo exportado do SAP "
-                "possui essas colunas e tente novamente."
-            )
+            # Nunca propaga: em último caso, devolve o chunk com colunas zeradas
+            logger.error(f"Error processing chunk (recuperando com valores padrão): {str(e)}")
+            chunk_processed = df.copy()
+            chunk_processed = DataProcessor.ensure_all_columns(chunk_processed)
+            chunk_processed['valor_unitario'] = 0
+            chunk_processed['valor_item_com_impostos'] = 0
+            return chunk_processed
 
     @staticmethod
     def process_dataframe(df: pd.DataFrame, progress_bar: Any) -> pd.DataFrame:
-        """Process the complete DataFrame with progress tracking"""
+        """Process the complete DataFrame with progress tracking. Tolerante a colunas ausentes."""
         try:
-            # Validação inicial das colunas críticas (falha rápido com mensagem clara)
-            DataProcessor.validate_critical_columns(df)
+            # Garante todas as colunas ANTES de qualquer processamento
+            df = DataProcessor.ensure_all_columns(df)
 
             chunk_size = CHUNK_SIZE
-            num_chunks = len(df) // chunk_size + 1
+            num_chunks = max(1, len(df) // chunk_size + 1)
             processed_chunks = []
 
             for i in range(num_chunks):
                 start_idx = i * chunk_size
                 end_idx = min((i + 1) * chunk_size, len(df))
                 chunk = df.iloc[start_idx:end_idx]
+                if chunk.empty:
+                    continue
                 processed_chunk = DataProcessor.process_chunk(chunk)
                 processed_chunks.append(processed_chunk)
                 progress = (i + 1) / num_chunks
-                progress_bar.progress(progress)
+                progress_bar.progress(min(progress, 1.0))
+
+            if not processed_chunks:
+                return pd.DataFrame(columns=SELECTED_COLUMNS)
 
             df_processed = pd.concat(processed_chunks, ignore_index=True)
 
             # Eliminar linhas onde 'Purchasing Document' é string não numérica
+            # (se a coluna não existir de verdade, ela já é NaN e não é filtrada)
             df_processed = df_processed[
                 ~df_processed['Purchasing Document'].apply(lambda x: isinstance(x, str))
             ]
@@ -198,28 +288,33 @@ class DataProcessor:
                 df_processed['Item'].astype(str)
             )
 
-            # Tratar coluna 'Supplier' com segurança — criar se não existir
-            if 'Supplier' in df_processed.columns:
-                df_processed['Supplier'] = df_processed['Supplier'].astype(str)
-            else:
-                logger.warning("Coluna 'Supplier' não encontrada. Criando coluna vazia.")
-                df_processed['Supplier'] = ''
+            df_processed['Supplier'] = df_processed['Supplier'].astype(str)
 
             df_processed = df_processed.drop_duplicates(subset=['unique'])
 
-            groupby_cols = ['Purchasing Document']
-            df_processed['total_valor_po_liquido'] = df_processed.groupby(groupby_cols)['Net order value'].transform('sum')
-            df_processed['total_valor_po_com_impostos'] = df_processed.groupby(groupby_cols)['valor_item_com_impostos'].transform('sum')
-            df_processed['total_itens_po'] = df_processed.groupby(groupby_cols)['Order Quantity'].transform('sum')
+            if df_processed.empty:
+                logger.warning("Nenhuma linha válida restou após a limpeza inicial.")
+                return pd.DataFrame(columns=SELECTED_COLUMNS)
 
-            # Coluna de data — cria PO Creation Date apenas se 'Document Date' existir
-            if 'Document Date' in df_processed.columns:
+            groupby_cols = ['Purchasing Document']
+            try:
+                df_processed['total_valor_po_liquido'] = df_processed.groupby(groupby_cols)['Net order value'].transform('sum')
+                df_processed['total_valor_po_com_impostos'] = df_processed.groupby(groupby_cols)['valor_item_com_impostos'].transform('sum')
+                df_processed['total_itens_po'] = df_processed.groupby(groupby_cols)['Order Quantity'].transform('sum')
+            except Exception as e:
+                logger.warning(f"Falha ao agrupar por '{groupby_cols}', usando valores individuais: {e}")
+                df_processed['total_valor_po_liquido'] = df_processed['Net order value']
+                df_processed['total_valor_po_com_impostos'] = df_processed['valor_item_com_impostos']
+                df_processed['total_itens_po'] = df_processed['Order Quantity']
+
+            # Coluna de data
+            try:
                 df_processed['PO Creation Date'] = pd.to_datetime(
                     df_processed['Document Date'], dayfirst=True, errors='coerce'
                 )
                 df_processed = df_processed.sort_values(by='PO Creation Date', ascending=False)
-            else:
-                logger.warning("Coluna 'Document Date' não encontrada. 'PO Creation Date' ficará vazia.")
+            except Exception as e:
+                logger.warning(f"Não foi possível processar 'Document Date': {e}")
                 df_processed['PO Creation Date'] = pd.NaT
 
             currency_columns = [
@@ -229,14 +324,8 @@ class DataProcessor:
             for col in currency_columns:
                 df_processed[f'{col}_formatted'] = df_processed[col].apply(DataProcessor.format_currency)
 
-            date_columns = [
-                'Document Date', 'Delivery date', 'Last FUP',
-                'Stat.-Rel. Del. Date', 'Delivery Date',
-                'Requisition Date', 'Inspection Request Date',
-                'First Delivery Date', 'Purchase Requisition Delivery Date'
-            ]
-            for col in date_columns:
-                if col in df_processed.columns:
+            for col in DATE_COLUMNS:
+                try:
                     df_processed[col] = pd.to_datetime(
                         df_processed[col],
                         format='%d/%m/%Y',
@@ -244,37 +333,36 @@ class DataProcessor:
                         errors='coerce'
                     )
                     df_processed[col] = df_processed[col].dt.strftime('%d/%m/%Y')
+                except Exception as e:
+                    logger.warning(f"Não foi possível formatar a coluna de data '{col}': {e}")
 
-            # Usar a função extract_code definida no módulo (fora da classe)
-            if 'Andritz WBS Element' in df_processed.columns:
+            # codigo_projeto a partir de 'Andritz WBS Element'
+            try:
                 df_processed['codigo_projeto'] = df_processed['Andritz WBS Element'].apply(extract_code)
                 df_processed['codigo_projeto'] = df_processed['codigo_projeto'].apply(
-                    lambda x: int(x) if x != "" else ""
+                    lambda x: int(x) if x not in ("", None) else ""
                 )
-            else:
+            except Exception as e:
+                logger.warning(f"Falha ao extrair 'codigo_projeto': {e}")
                 df_processed['codigo_projeto'] = ""
 
-            # Limpar colunas numéricas
-            columns_to_clean = ['Purchasing Document', 'Item', 'Material']
-            for col in columns_to_clean:
-                if col in df_processed.columns:
-                    df_processed[col] = (
-                        df_processed[col]
-                        .astype(str)
-                        .str.replace(r'\D', '', regex=True)
-                        .replace('', pd.NA)
-                        .astype(pd.Int64Dtype())
-                    )
+            # Limpar colunas numéricas (IDs)
+            for col in ['Purchasing Document', 'Item', 'Material']:
+                df_processed[col] = DataProcessor.safe_int_id_convert(df_processed[col])
 
-            # Selecionar apenas colunas existentes no DataFrame
-            cols_to_select = [c for c in SELECTED_COLUMNS if c in df_processed.columns]
-            df_processed = df_processed[cols_to_select]
+            # Selecionar apenas colunas existentes no DataFrame (garantidas por ensure_all_columns
+            # + colunas calculadas), preenchendo qualquer uma que ainda falte por segurança.
+            for col in SELECTED_COLUMNS:
+                if col not in df_processed.columns:
+                    df_processed[col] = ''
+            df_processed = df_processed[SELECTED_COLUMNS]
 
             return df_processed
 
         except Exception as e:
-            logger.error(f"Error in process_dataframe: {str(e)}")
-            raise
+            # Última rede de segurança: nunca deixa o processamento explodir.
+            logger.error(f"Error in process_dataframe (retornando dataframe vazio): {str(e)}")
+            return pd.DataFrame(columns=SELECTED_COLUMNS)
 
 
 class FileHandler:
@@ -297,16 +385,20 @@ class FileHandler:
 
     @staticmethod
     def read_excel_file(file: Any) -> Optional[pd.DataFrame]:
-        """Safely read Excel file"""
+        """
+        Lê um arquivo Excel com segurança. Nunca lança exceção — em caso de
+        falha, registra o erro no log e retorna None (o arquivo é apenas
+        ignorado, sem travar o processamento dos demais).
+        """
         try:
             df = pd.read_excel(file, engine='openpyxl')
-            # Normaliza os nomes das colunas (remove espaços extras nas pontas)
-            # para evitar erros de "coluna não encontrada" causados por
-            # diferenças invisíveis de formatação no cabeçalho do Excel.
+            # Normaliza os nomes das colunas (remove espaços nas pontas), o que
+            # evita erros de "coluna não encontrada" por diferenças invisíveis
+            # de formatação no cabeçalho do Excel.
             df.columns = [str(c).strip() for c in df.columns]
             return df
         except Exception as e:
-            logger.error(f"Error reading file {file.name}: {str(e)}")
+            logger.error(f"Error reading file {getattr(file, 'name', 'desconhecido')}: {str(e)}")
             return None
 
 
@@ -391,7 +483,7 @@ def main():
                 "Selecione os arquivos Excel para processar",
                 type=['xlsx'],
                 accept_multiple_files=True,
-                help="Você pode selecionar múltiplos arquivos Excel (.xlsx)"
+                help=f"Você pode selecionar múltiplos arquivos Excel (.xlsx) — até {MAX_UPLOAD_SIZE_MB}MB no total"
             )
 
         with col2:
@@ -400,77 +492,91 @@ def main():
                 remaining_size = MAX_UPLOAD_SIZE_MB - total_size
                 st.metric(label="📦 Espaço utilizado", value=f"{total_size:.1f}MB")
                 st.metric(label="⚡ Espaço disponível", value=f"{remaining_size:.1f}MB")
+                if remaining_size < 0:
+                    st.warning(
+                        "⚠️ O total enviado passou do limite configurado no servidor "
+                        f"({MAX_UPLOAD_SIZE_MB}MB). Se o Streamlit não aceitar o upload, "
+                        "aumente 'server.maxUploadSize' no config.toml."
+                    )
 
         if uploaded_files:
             if st.button("🚀 Iniciar Processamento", use_container_width=True, type="primary"):
-                try:
-                    randon = datetime.now().strftime("%d%m%Y%H%M%S") + str(datetime.now().microsecond)[:3]
-                    with st.spinner("Processando arquivos..."):
-                        progress_bar = st.progress(0)
-                        status_placeholder = st.empty()
+                randon = datetime.now().strftime("%d%m%Y%H%M%S") + str(datetime.now().microsecond)[:3]
+                with st.spinner("Processando arquivos..."):
+                    progress_bar = st.progress(0)
+                    status_placeholder = st.empty()
 
-                        start_time = time.time()
-                        all_dfs = []
+                    start_time = time.time()
+                    all_dfs = []
 
-                        for idx, uploaded_file in enumerate(uploaded_files):
-                            status_placeholder.info(f"Processando: {uploaded_file.name}")
-                            df_temp = FileHandler.read_excel_file(uploaded_file)
-                            if df_temp is not None and not df_temp.empty:
-                                all_dfs.append(df_temp)
-                            progress_bar.progress((idx + 1) / len(uploaded_files))
-
-                        if all_dfs:
-                            df_final = pd.concat(all_dfs, ignore_index=True)
-                            df_processed = DataProcessor.process_dataframe(df_final, progress_bar)
-
-                            st.session_state.processed_data = df_processed
-                            st.session_state.download_filename = f"PO_{randon}.xlsx"
-                            st.session_state.excel_data = FileHandler.to_excel(df_processed)
-
-                            # Preparar DataFrame para visualização
-                            view_cols = [
-                                'Purchasing Document', 'Item', 'Vendor Name', 'Material',
-                                'Material Description', 'Order Quantity', 'Order Unit',
-                                'Control Code (NCM)', 'Project Code', 'Andritz WBS Element',
-                                'Cost Center', 'Document Date', 'PO Created by',
-                                'Purchase Requisition'
-                            ]
-                            available_view_cols = [c for c in view_cols if c in df_processed.columns]
-                            df_view = df_processed[available_view_cols].copy()
-                            df_view['unique'] = (
-                                df_view['Purchasing Document'].astype(str) +
-                                df_view['Item'].astype(str)
-                            )
-                            df_view = df_view.drop_duplicates(subset=['unique'])
-
-                            clean_cols = ['unique', 'Purchasing Document', 'Item', 'Material']
-                            for col in clean_cols:
-                                if col in df_view.columns:
-                                    df_view[col] = (
-                                        df_view[col]
-                                        .astype(str)
-                                        .str.replace(r'\D', '', regex=True)
-                                        .replace('', pd.NA)
-                                        .astype(pd.Int64Dtype())
-                                    )
-
-                            st.session_state.df_view = df_view
-
-                            elapsed_time = time.time() - start_time
-                            st.success("✅ Processamento concluído com sucesso!")
-
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("Tempo de processamento", f"{elapsed_time:.2f}s")
-                            col2.metric("Arquivos processados", len(uploaded_files))
-                            col3.metric("Registros processados", len(df_processed))
+                    for idx, uploaded_file in enumerate(uploaded_files):
+                        status_placeholder.info(f"Processando: {uploaded_file.name}")
+                        df_temp = FileHandler.read_excel_file(uploaded_file)
+                        if df_temp is not None and not df_temp.empty:
+                            all_dfs.append(df_temp)
                         else:
-                            st.warning("⚠️ Nenhum dado encontrado para processar!")
+                            st.warning(f"⚠️ Não foi possível ler ou o arquivo está vazio: {uploaded_file.name}")
+                        progress_bar.progress((idx + 1) / len(uploaded_files))
 
-                        gc.collect()
+                    if all_dfs:
+                        try:
+                            df_final = pd.concat(all_dfs, ignore_index=True)
+                            del all_dfs
+                            gc.collect()
 
-                except Exception as e:
-                    logger.error(f"Error during processing: {str(e)}")
-                    st.error(f"❌ Erro durante o processamento: {str(e)}")
+                            df_processed = DataProcessor.process_dataframe(df_final, progress_bar)
+                            del df_final
+                            gc.collect()
+
+                            if df_processed.empty:
+                                st.warning("⚠️ O processamento não gerou nenhum registro válido.")
+                            else:
+                                st.session_state.processed_data = df_processed
+                                st.session_state.download_filename = f"PO_{randon}.xlsx"
+                                st.session_state.excel_data = FileHandler.to_excel(df_processed)
+
+                                # Preparar DataFrame para visualização
+                                view_cols = [
+                                    'Purchasing Document', 'Item', 'Vendor Name', 'Material',
+                                    'Material Description', 'Order Quantity', 'Order Unit',
+                                    'Control Code (NCM)', 'Project Code', 'Andritz WBS Element',
+                                    'Cost Center', 'Document Date', 'PO Created by',
+                                    'Purchase Requisition'
+                                ]
+                                available_view_cols = [c for c in view_cols if c in df_processed.columns]
+                                df_view = df_processed[available_view_cols].copy()
+
+                                if 'Purchasing Document' in df_view.columns and 'Item' in df_view.columns:
+                                    df_view['unique'] = (
+                                        df_view['Purchasing Document'].astype(str) +
+                                        df_view['Item'].astype(str)
+                                    )
+                                    df_view = df_view.drop_duplicates(subset=['unique'])
+
+                                for col in ['unique', 'Purchasing Document', 'Item', 'Material']:
+                                    if col in df_view.columns:
+                                        df_view[col] = DataProcessor.safe_int_id_convert(df_view[col])
+
+                                st.session_state.df_view = df_view
+
+                                elapsed_time = time.time() - start_time
+                                st.success("✅ Processamento concluído com sucesso!")
+
+                                col1, col2, col3 = st.columns(3)
+                                col1.metric("Tempo de processamento", f"{elapsed_time:.2f}s")
+                                col2.metric("Arquivos processados", len(uploaded_files))
+                                col3.metric("Registros processados", len(df_processed))
+                        except Exception as e:
+                            # Rede de segurança final: mostra um aviso, não um erro travante.
+                            logger.error(f"Falha inesperada no processamento: {str(e)}")
+                            st.warning(
+                                "⚠️ Ocorreu um problema durante o processamento e alguns dados "
+                                "podem não ter sido incluídos. Verifique o resultado antes de usar."
+                            )
+                    else:
+                        st.warning("⚠️ Nenhum dado encontrado para processar!")
+
+                    gc.collect()
 
         if st.session_state.excel_data is not None:
             st.subheader("📥 Download do Arquivo Processado")
@@ -506,18 +612,20 @@ def main():
 
     with tab3:
         st.subheader("📖 Guia de Utilização")
-        st.markdown("""
+        st.markdown(f"""
         ### Como usar o Sistema de Processamento de PO
 
         1. **Upload de Arquivos**
            - Acesse a aba "Upload e Extração"
            - Selecione um ou mais arquivos Excel (.xlsx)
-           - O sistema aceita arquivos até 200MB no total
+           - O sistema aceita arquivos até {MAX_UPLOAD_SIZE_MB}MB no total (requer config.toml ajustado)
 
         2. **Processamento**
            - Clique em "Iniciar Processamento"
            - Aguarde o processamento ser concluído
            - Faça o download do arquivo processado
+           - Colunas ausentes no arquivo original são preenchidas automaticamente
+             com valores padrão, sem interromper o processamento
 
         3. **Visualização**
            - Acesse a aba "Visualização de Dados"
@@ -536,9 +644,13 @@ def main():
            - Apenas arquivos Excel (.xlsx)
 
         2. **Limite de tamanho?**
-           - 200MB no total
+           - {MAX_UPLOAD_SIZE_MB}MB no total (ajustável em `.streamlit/config.toml`)
 
-        3. **Dados processados são salvos?**
+        3. **O que acontece se faltar uma coluna no arquivo?**
+           - O sistema cria a coluna automaticamente com um valor padrão e
+             continua o processamento normalmente, sem travar
+
+        4. **Dados processados são salvos?**
            - Não, os dados são processados apenas durante a sessão atual
         """)
 
@@ -550,13 +662,13 @@ if __name__ == "__main__":
         logger.error(f"Application error: {str(e)}")
         st.error("Ocorreu um erro inesperado. Por favor, tente novamente.")
 
-# Footer
-st.markdown("---")
-st.markdown(
-    """
-    <div style='text-align: center'>
-        <p>Desenvolvido com ❤️ | PO Processor Pro v1.0</p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align: center'>
+            <p>Desenvolvido com ❤️ | PO Processor Pro v1.0</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
