@@ -99,6 +99,20 @@ DATE_COLUMNS = [
 # Colunas de identificador que são normalizadas para inteiro
 ID_COLUMNS = ['Purchasing Document', 'Item', 'Material']
 
+# Quantas linhas no topo de cada arquivo podem ser escaneadas em busca do
+# cabeçalho real, caso as primeiras linhas estejam em branco ou sejam só
+# título/logo (comum em relatórios exportados do SAP GUI).
+HEADER_SCAN_MAX_ROWS = 20
+
+# Nomes de coluna conhecidos, usados só para RECONHECER com confiança qual
+# linha é o cabeçalho de verdade quando ele não está na linha 1.
+KNOWN_COLUMN_HINTS = {
+    'Purchasing Document', 'Item', 'Purchasing Group', 'Vendor Name', 'Vendor',
+    'Supplier', 'Material', 'Material Description', 'Status', 'Comment',
+    'Order Quantity', 'Net order value', 'PBXX Condition Amount', 'PBXX Amount',
+    'Price unit', 'Gross Price', 'Document Date', 'Andritz WBS Element',
+} | set(NUMERIC_SOURCE_COLUMNS) | set(DATE_COLUMNS) | set(ID_COLUMNS)
+
 # Colunas que PRECISAM existir no cabeçalho de cada arquivo para que os
 # cálculos façam sentido. Se faltarem, o arquivo ainda é processado (para
 # não travar o lote), mas um AVISO é registrado no diagnóstico, pois os
@@ -286,14 +300,76 @@ def friendly_open_error(e: Exception) -> str:
 # PASSADA 0 — mapear todas as colunas presentes em todos os arquivos
 # =============================================================================
 
-def scan_header(uploaded_file: Any) -> List[str]:
-    """Lê apenas a primeira linha do arquivo (custo desprezível de memória/tempo)."""
+def locate_header_and_rows(ws: Any) -> Tuple[List[str], Any, int]:
+    """
+    Encontra a linha de cabeçalho real dentro das primeiras
+    HEADER_SCAN_MAX_ROWS linhas do arquivo, mesmo que existam linhas em
+    branco ou de título/logo acima dela (comum em exports do SAP GUI).
+
+    Estratégia: dá uma pontuação a cada linha não totalmente vazia dentro da
+    janela de escaneamento, contando quantas células batem com nomes de
+    coluna conhecidos (KNOWN_COLUMN_HINTS). A linha com maior pontuação (>=2
+    matches) vence. Se nenhuma linha bater com nomes conhecidos, usa como
+    reserva a primeira linha não vazia com pelo menos 3 células preenchidas
+    (evita confundir uma linha de título de 1 célula com o cabeçalho real).
+
+    Retorna (header_normalizado, gerador_das_linhas_de_dados_restantes,
+    índice_da_linha_de_cabeçalho). Só a janela de escaneamento (no máximo
+    HEADER_SCAN_MAX_ROWS linhas) fica em memória — o resto do arquivo
+    continua sendo lido em streaming, um registro de cada vez.
+    """
+    rows_iter = ws.iter_rows(values_only=True)
+    scanned: List[Tuple[Any, ...]] = []
+    best_idx: Optional[int] = None
+    best_score = -1
+    fallback_idx: Optional[int] = None
+
+    for i, row in enumerate(rows_iter):
+        scanned.append(row)
+        non_empty = [c for c in row if c is not None and str(c).strip() != '']
+        if non_empty:
+            score = sum(1 for c in non_empty if str(c).strip() in KNOWN_COLUMN_HINTS)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+            if fallback_idx is None and len(non_empty) >= 3:
+                fallback_idx = i
+        if i >= HEADER_SCAN_MAX_ROWS - 1:
+            break
+
+    if best_score >= 2:
+        header_idx = best_idx
+    elif fallback_idx is not None:
+        header_idx = fallback_idx
+    elif best_idx is not None:
+        header_idx = best_idx
+    else:
+        header_idx = None
+
+    if header_idx is None:
+        return [], iter(()), -1
+
+    header = normalize_header(scanned[header_idx])
+    remaining_buffered = scanned[header_idx + 1:]
+
+    def _chained_rows():
+        for r in remaining_buffered:
+            yield r
+        for r in rows_iter:
+            yield r
+
+    return header, _chained_rows(), header_idx
+
+
+def scan_header(uploaded_file: Any) -> Tuple[List[str], int]:
+    """Lê só a janela inicial do arquivo para localizar o cabeçalho real
+    (custo desprezível de memória/tempo). Retorna (cabeçalho, índice_da_linha)."""
     uploaded_file.seek(0)
     wb = load_workbook(uploaded_file, read_only=True, data_only=True)
     try:
         ws = wb.worksheets[0]
-        first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
-        return normalize_header(first_row)
+        header, _, header_idx = locate_header_and_rows(ws)
+        return header, header_idx
     finally:
         wb.close()
         uploaded_file.seek(0)
@@ -314,7 +390,7 @@ def build_master_columns(
 
     for f in uploaded_files:
         try:
-            header = scan_header(f)
+            header, header_idx = scan_header(f)
         except Exception as e:
             logger.exception(f"Falha ao ler cabeçalho de {f.name}")
             diagnostics.append({
@@ -325,18 +401,33 @@ def build_master_columns(
             })
             continue
 
-        if not any(header):
+        if header_idx == -1 or not any(header):
             diagnostics.append({
                 'arquivo': f.name,
                 'etapa': 'Etapa 1 — Mapeamento de colunas',
                 'tipo': 'erro',
                 'mensagem': (
-                    "A primeira linha da planilha está vazia. Verifique se o "
-                    "cabeçalho está mesmo na linha 1 (sem títulos ou linhas em "
-                    "branco acima dele)."
+                    f"Não foi possível localizar uma linha de cabeçalho nas "
+                    f"primeiras {HEADER_SCAN_MAX_ROWS} linhas do arquivo (todas "
+                    "vazias, ou nenhuma parece uma linha de colunas de verdade). "
+                    "Verifique se o cabeçalho existe e não está mais abaixo do "
+                    "que o esperado."
                 ),
             })
             continue
+
+        if header_idx > 0:
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 1 — Mapeamento de colunas',
+                'tipo': 'aviso',
+                'mensagem': (
+                    f"O cabeçalho não estava na linha 1 — foram encontradas "
+                    f"{header_idx} linha(s) em branco/título acima dele, que "
+                    "foram ignoradas automaticamente. O cabeçalho real foi "
+                    f"localizado na linha {header_idx + 1} da planilha."
+                ),
+            })
 
         faltando = [c for c in REQUIRED_COLUMNS if c not in header]
         if faltando:
@@ -379,8 +470,9 @@ def aggregate_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
     processed = 0
     try:
         ws = wb.worksheets[0]
-        rows_iter = ws.iter_rows(values_only=True)
-        header = normalize_header(next(rows_iter, ()))
+        header, rows_iter, header_idx = locate_header_and_rows(ws)
+        if header_idx == -1:
+            return 0
         col_idx = build_col_index(header)
 
         for row in rows_iter:
@@ -436,8 +528,9 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
     written = 0
     try:
         ws = wb.worksheets[0]
-        rows_iter = ws.iter_rows(values_only=True)
-        header = normalize_header(next(rows_iter, ()))
+        header, rows_iter, header_idx = locate_header_and_rows(ws)
+        if header_idx == -1:
+            return 0
         col_idx = build_col_index(header)
 
         for row in rows_iter:
