@@ -488,6 +488,15 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
                     val = item_id
                 elif col == 'Material':
                     val = material_id
+                # IMPORTANTE: nunca deixar None aqui. dict.get(col, '') só usa
+                # o fallback '' quando a CHAVE não existe — como a chave é
+                # sempre atribuída (mesmo quando o valor da célula é None,
+                # por exemplo quando este arquivo não tem essa coluna), sem
+                # essa conversão a linha gravada ficava mais curta que o
+                # cabeçalho final e o preview quebrava ao montar o DataFrame
+                # ("N columns passed, passed data had M columns").
+                if val is None:
+                    val = ''
                 out_row[col] = val
 
             out_row['total_itens_po'] = totals['qty']
@@ -525,10 +534,18 @@ def read_preview_rows(path: str, n: int = PREVIEW_ROWS) -> pd.DataFrame:
         ws = wb.worksheets[0]
         rows_iter = ws.iter_rows(values_only=True)
         header = normalize_header(next(rows_iter, ()))
+        n_cols = len(header)
         preview_rows = []
         for i, row in enumerate(rows_iter):
             if i >= n:
                 break
+            # Defensa extra: nunca deixar uma linha mais curta/longa que o
+            # cabeçalho quebrar o preview — completa com '' ou corta o excesso.
+            row = list(row)
+            if len(row) < n_cols:
+                row = row + [''] * (n_cols - len(row))
+            elif len(row) > n_cols:
+                row = row[:n_cols]
             preview_rows.append(row)
         return pd.DataFrame(preview_rows, columns=header)
     finally:
