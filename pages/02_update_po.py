@@ -4,7 +4,7 @@
 # O limite de tamanho de upload NÃO é controlado pelo código Python — ele é
 # imposto pelo próprio servidor do Streamlit antes do seu script rodar.
 # Para permitir uploads maiores (ex: 500MB), garanta que exista o arquivo
-# ".streamlit/config.toml" na mesma pasta deste script com o conteúdo:
+# ".streamlit/config.toml" na MESMA PASTA deste script com o conteúdo:
 #
 #   [server]
 #   maxUploadSize = 550
@@ -14,63 +14,41 @@
 #
 #   streamlit run po_processor_streamlit.py --server.maxUploadSize=550
 #
-# Sem uma dessas duas opções, o Streamlit vai barrar o upload em 200MB mesmo
-# que o código aqui já esteja preparado para tamanhos maiores.
+# Se o uploader na tela mostrar "Limit 200MB per file", o config.toml NÃO
+# está sendo lido (pasta errada, ou o processo não foi reiniciado depois de
+# criar o arquivo). Sem isso, o Streamlit barra o upload em 200MB mesmo que
+# o código aqui já esteja preparado para tamanhos maiores.
 # =============================================================================
 #
 # =============================================================================
-# ARQUITETURA DESTE SCRIPT (reescrito para consumir pouca memória)
+# ARQUITETURA DESTE SCRIPT (memória baixa + isolamento de falhas por arquivo)
 # -----------------------------------------------------------------------------
-# A versão anterior lia todos os arquivos com pandas, concatenava tudo em um
-# único DataFrame gigante na memória e só então processava. Isso significa
-# que o pico de memória era proporcional à soma de TODOS os arquivos juntos.
+# Esta versão processa cada arquivo, um de cada vez, usando openpyxl em modo
+# "read_only" (leitura linha a linha) e grava o resultado direto em disco em
+# modo "write_only" (também linha a linha) — sem nunca carregar tudo na RAM.
 #
-# Esta versão processa cada arquivo, um de cada vez, usando o openpyxl em
-# modo "read_only" (leitura linha a linha, sem carregar a planilha inteira
-# na memória) e grava o resultado direto em disco em modo "write_only"
-# (também linha a linha, sem acumular o resultado inteiro na memória).
+# NOVIDADE NESTA VERSÃO: isolamento de falhas por arquivo.
+# Antes, se QUALQUER arquivo do lote desse um erro inesperado (arquivo
+# corrompido, protegido por senha, formato antigo .xls renomeado para
+# .xlsx, cabeçalho fora da linha 1, etc.), o processamento inteiro era
+# abortado e o usuário só via um aviso genérico, sem saber qual arquivo ou
+# por quê. Agora:
 #
-# Como o cálculo de totais por Pedido de Compra (PO) depende de somar todas
-# as linhas daquele PO — que podem estar espalhadas em posições diferentes
-# do arquivo, ou até em arquivos diferentes — não dá pra gerar o resultado
-# final em uma única leitura sequencial. A solução é fazer 3 passadas curtas,
-# cada uma lendo os arquivos um por vez (sem empilhar todos na RAM):
+#   - Cada etapa (mapear colunas / agregar totais / gravar linhas) roda por
+#     arquivo dentro de um try/except próprio.
+#   - Se um arquivo falhar, ele é marcado como "com erro", pulado, e o
+#     processamento CONTINUA normalmente para os demais arquivos do lote.
+#   - Todos os erros (arquivo, etapa, mensagem, traceback) são guardados em
+#     st.session_state.file_diagnostics e exibidos na aba "🛠️ Diagnóstico",
+#     junto com avisos de colunas obrigatórias ausentes por arquivo.
 #
-#   PASSADA 0 — Mapear colunas:
-#       Lê só a linha de cabeçalho de cada arquivo (custo desprezível) para
-#       montar a lista de TODAS as colunas que apareceram em qualquer
-#       arquivo, na ordem em que foram vistas. Nenhuma coluna é descartada.
+# Continuam válidas as 3 passadas (mapear colunas -> agregar totais por PO
+# -> gravar arquivo final linha a linha) e o trade-off de não ordenar por
+# data (ordene no Excel/Sheets depois de baixar, se precisar).
 #
-#   PASSADA 1 — Agregar totais por PO:
-#       Percorre linha a linha cada arquivo (um de cada vez, fechando antes
-#       de abrir o próximo) e acumula, em um dicionário pequeno (uma entrada
-#       por PO, não por linha), os totais de valor líquido, valor com
-#       impostos e quantidade. Esse dicionário é a única coisa "grande" que
-#       fica na memória inteira do processamento — e ele é muito menor que
-#       os dados brutos, pois tem 1 linha por PO, não 1 linha por item.
-#
-#   PASSADA 2 — Gravar o arquivo final:
-#       Percorre novamente cada arquivo, linha a linha, calcula as colunas
-#       derivadas (valor unitário, totais por PO já calculados na Passada 1,
-#       código do projeto, datas formatadas, etc.) e grava CADA LINHA direto
-#       no arquivo Excel de saída em disco (modo write_only do openpyxl, que
-#       transmite cada linha para o arquivo assim que ela é adicionada, sem
-#       guardar tudo em memória).
-#
-# TRADE-OFF ASSUMIDO (para caber em pouca RAM):
-#   - Fazemos 3 leituras de cada arquivo em vez de 1. Isso custa mais tempo
-#     de processamento (mais I/O), mas mantém o pico de memória baixo e
-#     estável, independente do tamanho total dos arquivos.
-#   - O arquivo final NÃO é mais ordenado por data de criação do PO (ordenar
-#     exigiria ter todas as linhas em memória ao mesmo tempo, o que
-#     contradiz o objetivo de economizar RAM). As linhas saem na mesma ordem
-#     em que aparecem nos arquivos de origem. Se precisar ordenado, use
-#     "Dados > Classificar" no Excel/Google Sheets depois de baixar — é
-#     rápido porque o arquivo final já está pronto.
-#   - Todas as colunas originais de cada arquivo são preservadas no arquivo
-#     final (união das colunas de todos os arquivos enviados), além das
-#     colunas calculadas (valor_unitario, totais por PO, código do projeto,
-#     etc.), que são adicionadas ao final.
+# TODAS as colunas originais de cada arquivo continuam preservadas no
+# arquivo final (união das colunas de todos os arquivos enviados que foram
+# processados com sucesso), mais as colunas calculadas ao final.
 # =============================================================================
 
 import streamlit as st
@@ -80,11 +58,14 @@ import time
 import os
 import gc
 import re
+import traceback
 import tempfile
+import zipfile
 import logging
 from typing import List, Optional, Any, Dict, Set, Tuple
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 # Desabilitar a exibição de separadores de milhar
 pd.options.display.float_format = '{:,.0f}'.format
@@ -117,6 +98,12 @@ DATE_COLUMNS = [
 
 # Colunas de identificador que são normalizadas para inteiro
 ID_COLUMNS = ['Purchasing Document', 'Item', 'Material']
+
+# Colunas que PRECISAM existir no cabeçalho de cada arquivo para que os
+# cálculos façam sentido. Se faltarem, o arquivo ainda é processado (para
+# não travar o lote), mas um AVISO é registrado no diagnóstico, pois os
+# valores derivados daquela coluna sairão zerados/vazios para aquele arquivo.
+REQUIRED_COLUMNS = ['Purchasing Document', 'Item', 'Order Quantity', 'Net order value']
 
 # Colunas calculadas que são adicionadas ao final do arquivo, na ordem abaixo
 # (qualquer uma que já exista como coluna original não é duplicada)
@@ -277,6 +264,24 @@ def get_cell(row: Tuple[Any, ...], col_idx: Dict[str, int], name: str, default: 
     return row[i]
 
 
+def friendly_open_error(e: Exception) -> str:
+    """Traduz as exceções mais comuns do openpyxl/zipfile em mensagens úteis."""
+    if isinstance(e, zipfile.BadZipFile):
+        return (
+            "O arquivo não é um .xlsx válido (zip corrompido). Isso costuma acontecer "
+            "quando o arquivo é na verdade um .xls antigo, um HTML/SYLK exportado pelo "
+            "SAP e apenas renomeado para .xlsx, ou o download foi interrompido/corrompido. "
+            "Abra o arquivo no Excel e use 'Salvar como > Excel Workbook (.xlsx)' para regravá-lo."
+        )
+    if isinstance(e, InvalidFileException):
+        return (
+            "O openpyxl não reconheceu o formato do arquivo. Verifique se ele não está "
+            "protegido por senha (arquivos criptografados não podem ser abertos "
+            "diretamente) e se a extensão .xlsx corresponde ao conteúdo real do arquivo."
+        )
+    return str(e)
+
+
 # =============================================================================
 # PASSADA 0 — mapear todas as colunas presentes em todos os arquivos
 # =============================================================================
@@ -294,17 +299,66 @@ def scan_header(uploaded_file: Any) -> List[str]:
         uploaded_file.seek(0)
 
 
-def build_master_columns(uploaded_files: List[Any]) -> List[str]:
-    """União de todas as colunas de todos os arquivos, na ordem em que aparecem."""
+def build_master_columns(
+    uploaded_files: List[Any], diagnostics: List[Dict[str, str]]
+) -> Tuple[List[str], List[Any]]:
+    """
+    União de todas as colunas de todos os arquivos válidos, na ordem em que
+    aparecem. Arquivos que falharem ao ter o cabeçalho lido são registrados
+    em `diagnostics` e EXCLUÍDOS de `valid_files` (que é retornado junto),
+    para que as etapas seguintes nem tentem reabri-los.
+    """
     master_columns: List[str] = []
     seen: Set[str] = set()
+    valid_files: List[Any] = []
+
     for f in uploaded_files:
-        header = scan_header(f)
+        try:
+            header = scan_header(f)
+        except Exception as e:
+            logger.exception(f"Falha ao ler cabeçalho de {f.name}")
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 1 — Mapeamento de colunas',
+                'tipo': 'erro',
+                'mensagem': friendly_open_error(e),
+            })
+            continue
+
+        if not any(header):
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 1 — Mapeamento de colunas',
+                'tipo': 'erro',
+                'mensagem': (
+                    "A primeira linha da planilha está vazia. Verifique se o "
+                    "cabeçalho está mesmo na linha 1 (sem títulos ou linhas em "
+                    "branco acima dele)."
+                ),
+            })
+            continue
+
+        faltando = [c for c in REQUIRED_COLUMNS if c not in header]
+        if faltando:
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 1 — Mapeamento de colunas',
+                'tipo': 'aviso',
+                'mensagem': (
+                    "Colunas obrigatórias ausentes neste arquivo: "
+                    f"{', '.join(faltando)}. As linhas deste arquivo ainda serão "
+                    "processadas, mas os totais/valores derivados dessas colunas "
+                    "sairão zerados ou vazios para ele."
+                ),
+            })
+
+        valid_files.append(f)
         for col in header:
             if col and col not in seen:
                 seen.add(col)
                 master_columns.append(col)
-    return master_columns
+
+    return master_columns, valid_files
 
 
 # =============================================================================
@@ -315,9 +369,10 @@ def aggregate_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
                     seen_keys: Set[Tuple[Optional[int], Optional[int]]]) -> int:
     """
     Percorre um arquivo linha a linha e acumula os totais por PO em `po_totals`.
-    `seen_keys` evita contar a mesma linha (mesmo PO+Item) duas vezes, da
-    mesma forma que o processamento original removia duplicatas antes de somar.
+    `seen_keys` evita contar a mesma linha (mesmo PO+Item) duas vezes.
     Retorna o número de linhas válidas processadas (para métricas/log).
+    Pode lançar exceção — o chamador (process_files) é responsável por
+    isolar a falha por arquivo.
     """
     uploaded_file.seek(0)
     wb = load_workbook(uploaded_file, read_only=True, data_only=True)
@@ -373,6 +428,8 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
     Percorre um arquivo linha a linha, calcula as colunas derivadas e grava
     cada linha diretamente na planilha de saída (write_only), sem acumular
     o resultado em memória. Retorna o número de linhas gravadas.
+    Pode lançar exceção — o chamador (process_files) é responsável por
+    isolar a falha por arquivo.
     """
     uploaded_file.seek(0)
     wb = load_workbook(uploaded_file, read_only=True, data_only=True)
@@ -479,33 +536,57 @@ def read_preview_rows(path: str, n: int = PREVIEW_ROWS) -> pd.DataFrame:
 
 
 # =============================================================================
-# Orquestração do pipeline completo (as 3 passadas)
+# Orquestração do pipeline completo (as 3 passadas, com isolamento de falhas)
 # =============================================================================
 
 def process_files(uploaded_files: List[Any], progress_bar: Any, status_placeholder: Any) -> Dict[str, Any]:
     """
     Executa as 3 passadas sobre a lista de arquivos e grava o resultado em um
     arquivo temporário em disco. Retorna um dicionário com o caminho do
-    arquivo final e as métricas calculadas.
+    arquivo final, as métricas calculadas e a lista de diagnósticos
+    (erros/avisos por arquivo) encontrados ao longo do processamento.
     """
+    diagnostics: List[Dict[str, str]] = []
     n_files = len(uploaded_files)
 
     # --- Passada 0: mapear colunas -----------------------------------------
     status_placeholder.info("🔎 Etapa 1/3 — Mapeando colunas dos arquivos...")
-    master_columns = build_master_columns(uploaded_files)
+    master_columns, valid_files = build_master_columns(uploaded_files, diagnostics)
     final_header = master_columns + [c for c in COMPUTED_COLUMNS_ORDER if c not in master_columns]
     progress_bar.progress(0.05)
+
+    if not valid_files:
+        return {
+            'output_path': None,
+            'total_rows': 0,
+            'total_pos': 0,
+            'total_vendors': 0,
+            'total_columns': 0,
+            'diagnostics': diagnostics,
+            'files_ok': 0,
+            'files_total': n_files,
+        }
 
     # --- Passada 1: agregar totais por PO -----------------------------------
     po_totals: Dict[int, Dict[str, float]] = {}
     seen_keys_agg: Set[Tuple[Optional[int], Optional[int]]] = set()
-    total_rows_agg = 0
-    for idx, f in enumerate(uploaded_files):
+    files_ok_agg: List[Any] = []
+    for idx, f in enumerate(valid_files):
         status_placeholder.info(
-            f"➕ Etapa 2/3 — Calculando totais por PO... arquivo {idx + 1}/{n_files}: {f.name}"
+            f"➕ Etapa 2/3 — Calculando totais por PO... arquivo {idx + 1}/{len(valid_files)}: {f.name}"
         )
-        total_rows_agg += aggregate_file(f, po_totals, seen_keys_agg)
-        progress_bar.progress(0.05 + 0.45 * ((idx + 1) / n_files))
+        try:
+            aggregate_file(f, po_totals, seen_keys_agg)
+            files_ok_agg.append(f)
+        except Exception as e:
+            logger.exception(f"Falha ao agregar totais do arquivo {f.name}")
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 2 — Cálculo de totais por PO',
+                'tipo': 'erro',
+                'mensagem': friendly_open_error(e),
+            })
+        progress_bar.progress(0.05 + 0.45 * ((idx + 1) / len(valid_files)))
     del seen_keys_agg
     gc.collect()
 
@@ -520,14 +601,27 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
     seen_keys_write: Set[Tuple[Optional[int], Optional[int]]] = set()
     vendor_names_seen: Set[str] = set()
     total_rows_written = 0
-    for idx, f in enumerate(uploaded_files):
+    files_ok_write = 0
+    # Só tenta gravar arquivos que sobreviveram à etapa de agregação, para
+    # manter os totais por PO consistentes com as linhas gravadas.
+    for idx, f in enumerate(files_ok_agg):
         status_placeholder.info(
-            f"💾 Etapa 3/3 — Gerando arquivo final... arquivo {idx + 1}/{n_files}: {f.name}"
+            f"💾 Etapa 3/3 — Gerando arquivo final... arquivo {idx + 1}/{len(files_ok_agg)}: {f.name}"
         )
-        total_rows_written += write_file_rows(
-            f, ws_out, master_columns, final_header, po_totals, seen_keys_write, vendor_names_seen
-        )
-        progress_bar.progress(0.5 + 0.45 * ((idx + 1) / n_files))
+        try:
+            total_rows_written += write_file_rows(
+                f, ws_out, master_columns, final_header, po_totals, seen_keys_write, vendor_names_seen
+            )
+            files_ok_write += 1
+        except Exception as e:
+            logger.exception(f"Falha ao gravar linhas do arquivo {f.name}")
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 3 — Gravação do arquivo final',
+                'tipo': 'erro',
+                'mensagem': friendly_open_error(e),
+            })
+        progress_bar.progress(0.5 + 0.45 * ((idx + 1) / max(len(files_ok_agg), 1)))
 
     wb_out.save(out_path)
     progress_bar.progress(1.0)
@@ -538,6 +632,9 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
         'total_pos': len(po_totals),
         'total_vendors': len(vendor_names_seen),
         'total_columns': len(final_header),
+        'diagnostics': diagnostics,
+        'files_ok': files_ok_write,
+        'files_total': n_files,
     }
 
 
@@ -583,14 +680,20 @@ def main():
         st.session_state.download_filename = None
         st.session_state.metrics = None
         st.session_state.preview_df = None
+        st.session_state.file_diagnostics = []
+        st.session_state.last_exception = None
 
     st.header("📑 Sistema de Processamento de Pedidos de Compra")
     st.caption(
         "Processamento em lote: cada arquivo é lido e liberado da memória um de "
         "cada vez, e o resultado é gravado em disco linha a linha — sem manter "
-        "todos os dados na RAM de uma vez. Todas as colunas originais são preservadas."
+        "todos os dados na RAM de uma vez. Todas as colunas originais são preservadas. "
+        "Se um arquivo específico tiver problema, ele é isolado e reportado, sem "
+        "derrubar o processamento dos demais."
     )
-    tab1, tab2, tab3 = st.tabs(["📤 Upload e Extração", "📊 Visualização de Dados", "❓ Como Utilizar"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📤 Upload e Extração", "📊 Visualização de Dados", "🛠️ Diagnóstico", "❓ Como Utilizar"
+    ])
 
     with tab1:
         col1, col2 = st.columns([3, 1])
@@ -628,9 +731,13 @@ def main():
 
                     try:
                         result = process_files(uploaded_files, progress_bar, status_placeholder)
+                        st.session_state.file_diagnostics = result.get('diagnostics', [])
 
                         if result['total_rows'] == 0:
-                            st.warning("⚠️ O processamento não gerou nenhum registro válido.")
+                            st.error(
+                                "❌ O processamento não gerou nenhum registro válido. "
+                                "Veja os detalhes na aba '🛠️ Diagnóstico'."
+                            )
                             cleanup_output_file()
                         else:
                             st.session_state.output_path = result['output_path']
@@ -641,18 +748,34 @@ def main():
                             st.session_state.preview_df = read_preview_rows(result['output_path'])
 
                             elapsed_time = time.time() - start_time
-                            st.success("✅ Processamento concluído com sucesso!")
+
+                            if result['files_ok'] < result['files_total']:
+                                st.warning(
+                                    f"⚠️ Processamento concluído, mas {result['files_total'] - result['files_ok']} "
+                                    f"de {result['files_total']} arquivo(s) NÃO foram incluídos por erro. "
+                                    "Veja a aba '🛠️ Diagnóstico' para saber qual arquivo e o motivo."
+                                )
+                            elif result.get('diagnostics'):
+                                st.success(
+                                    "✅ Processamento concluído com sucesso, com alguns avisos "
+                                    "(veja a aba '🛠️ Diagnóstico')."
+                                )
+                            else:
+                                st.success("✅ Processamento concluído com sucesso, 100% dos arquivos incluídos!")
 
                             m1, m2, m3, m4 = st.columns(4)
                             m1.metric("Tempo de processamento", f"{elapsed_time:.2f}s")
-                            m2.metric("Arquivos processados", len(uploaded_files))
+                            m2.metric("Arquivos incluídos", f"{result['files_ok']}/{result['files_total']}")
                             m3.metric("Registros processados", result['total_rows'])
                             m4.metric("PO's distintas", result['total_pos'])
                     except Exception as e:
+                        # Falha realmente inesperada (fora do isolamento por arquivo).
+                        # Agora mostramos o motivo de verdade, em vez de esconder.
                         logger.error(f"Falha inesperada no processamento: {str(e)}")
-                        st.warning(
-                            "⚠️ Ocorreu um problema durante o processamento e alguns dados "
-                            "podem não ter sido incluídos. Verifique o resultado antes de usar."
+                        st.session_state.last_exception = traceback.format_exc()
+                        st.error(
+                            "❌ Ocorreu um erro inesperado e o processamento foi interrompido. "
+                            "Detalhes técnicos na aba '🛠️ Diagnóstico'."
                         )
                         cleanup_output_file()
 
@@ -696,6 +819,38 @@ def main():
             st.info("Faça o upload dos arquivos na aba 'Upload e Extração' para visualizar os dados.")
 
     with tab3:
+        st.subheader("🛠️ Diagnóstico do último processamento")
+        diags = st.session_state.get('file_diagnostics') or []
+        last_exc = st.session_state.get('last_exception')
+
+        if not diags and not last_exc:
+            st.info(
+                "Nenhum erro ou aviso registrado ainda. Depois de rodar o processamento, "
+                "qualquer arquivo com problema (corrompido, protegido por senha, coluna "
+                "obrigatória ausente, etc.) vai aparecer detalhado aqui."
+            )
+        else:
+            if diags:
+                erros = [d for d in diags if d['tipo'] == 'erro']
+                avisos = [d for d in diags if d['tipo'] == 'aviso']
+
+                if erros:
+                    st.markdown(f"#### ❌ Erros ({len(erros)}) — arquivo(s) excluído(s) do resultado")
+                    for d in erros:
+                        with st.expander(f"{d['arquivo']} — {d['etapa']}"):
+                            st.write(d['mensagem'])
+
+                if avisos:
+                    st.markdown(f"#### ⚠️ Avisos ({len(avisos)}) — arquivo processado mesmo assim")
+                    for d in avisos:
+                        with st.expander(f"{d['arquivo']} — {d['etapa']}"):
+                            st.write(d['mensagem'])
+
+            if last_exc:
+                st.markdown("#### 💥 Erro inesperado (interrompeu todo o processamento)")
+                st.code(last_exc, language="text")
+
+    with tab4:
         st.subheader("📖 Guia de Utilização")
         st.markdown(f"""
         ### Como usar o Sistema de Processamento de PO
@@ -706,38 +861,55 @@ def main():
            - O sistema aceita arquivos até {MAX_UPLOAD_SIZE_MB}MB no total (requer config.toml ajustado)
 
         2. **Processamento (em 3 etapas, por arquivo)**
-           - Etapa 1: mapeia todas as colunas presentes nos arquivos
+           - Etapa 1: mapeia todas as colunas presentes nos arquivos e valida colunas obrigatórias
            - Etapa 2: calcula os totais por Pedido de Compra (PO)
            - Etapa 3: grava o arquivo final direto em disco, linha a linha
            - Cada arquivo é aberto, processado e liberado da memória antes do próximo
-           - Colunas ausentes em um arquivo específico ficam em branco para aquele arquivo,
-             sem interromper o processamento
+           - Se UM arquivo falhar em qualquer etapa, ele é isolado e reportado na aba
+             "🛠️ Diagnóstico" — os demais arquivos do lote continuam sendo processados
 
         3. **Visualização**
            - Acesse a aba "Visualização de Dados"
            - Veja as métricas gerais e uma prévia das primeiras {PREVIEW_ROWS} linhas
 
-        ### O que muda em relação à versão anterior
-        - **Todas as colunas originais** de todos os arquivos são mantidas no resultado
-          (união das colunas de cada arquivo), além das colunas calculadas.
-        - O processamento não carrega todos os arquivos na memória de uma vez — cada
-          arquivo é lido e liberado individualmente, em até 3 passagens leves.
-        - O arquivo final **não vem mais ordenado por data** (ordenar exigiria manter
-          tudo em memória). Se precisar, ordene no Excel/Sheets após o download —
-          é rápido, pois o arquivo já está pronto.
+        4. **Diagnóstico**
+           - Sempre que algo não sair 100% como esperado, confira essa aba antes de
+             qualquer outra coisa — ela mostra exatamente qual arquivo, em qual etapa,
+             e qual foi o erro ou aviso.
+
+        ### Estrutura esperada da planilha (por arquivo)
+        - Cabeçalho **exatamente na linha 1** (sem título, logo ou linhas em branco acima)
+        - Nenhuma célula mesclada na linha de cabeçalho
+        - Colunas obrigatórias presentes, com esses nomes exatos:
+          `Purchasing Document`, `Item`, `Order Quantity`, `Net order value`
+        - Formato real `.xlsx` (não `.xls` antigo renomeado, não HTML/SYLK exportado
+          do SAP com a extensão trocada, e sem senha/proteção)
+        - Colunas de data no formato de data do Excel ou texto reconhecível
+          (`dd/mm/aaaa` ou `aaaa-mm-dd`)
+
+        ### O que fazer se o Diagnóstico apontar "arquivo corrompido / formato inválido"
+        - Abra o arquivo no Excel e use **Arquivo > Salvar como > Excel Workbook (.xlsx)**
+          para regravá-lo em formato .xlsx nativo, depois reenvie.
+        - Se o arquivo tiver senha, remova a proteção antes de enviar.
 
         ### Dúvidas Frequentes
         1. **Tipos de arquivo aceitos?**
-           - Apenas arquivos Excel (.xlsx)
+           - Apenas arquivos Excel (.xlsx) nativos.
 
         2. **Limite de tamanho?**
-           - {MAX_UPLOAD_SIZE_MB}MB no total (ajustável em `.streamlit/config.toml`)
+           - {MAX_UPLOAD_SIZE_MB}MB no total (ajustável em `.streamlit/config.toml`, veja o
+             topo deste arquivo). Se o uploader mostrar "Limit 200MB per file", o
+             config.toml não está sendo aplicado nesta sessão.
 
-        3. **O que acontece se faltar uma coluna em um dos arquivos?**
-           - A coluna aparece em branco apenas para as linhas daquele arquivo;
-             o processamento continua normalmente para todos os arquivos.
+        3. **O que acontece se faltar uma coluna obrigatória em um dos arquivos?**
+           - O arquivo ainda é processado, mas os valores derivados dessa coluna saem
+             zerados/vazios para ele, e um aviso aparece na aba Diagnóstico.
 
-        4. **Dados processados são salvos?**
+        4. **E se um arquivo estiver corrompido ou protegido por senha?**
+           - Esse arquivo específico é excluído do resultado (não trava o lote inteiro),
+             e o motivo exato aparece na aba Diagnóstico.
+
+        5. **Dados processados são salvos?**
            - O arquivo final fica em um arquivo temporário no servidor durante a sessão
              e é removido ao clicar em "Limpar e Voltar ao Início" (ou ao reiniciar a sessão).
         """)
@@ -749,12 +921,14 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Application error: {str(e)}")
         st.error("Ocorreu um erro inesperado. Por favor, tente novamente.")
+        with st.expander("Detalhes técnicos"):
+            st.code(traceback.format_exc(), language="text")
 
     st.markdown("---")
     st.markdown(
         """
         <div style='text-align: center'>
-            <p>Desenvolvido com ❤️ | PO Processor Pro v2.0 (processamento em lote)</p>
+            <p>Desenvolvido com ❤️ | PO Processor Pro v2.1 (isolamento de falhas por arquivo)</p>
         </div>
         """,
         unsafe_allow_html=True
