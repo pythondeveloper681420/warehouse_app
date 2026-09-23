@@ -17,26 +17,6 @@ from sendgrid.helpers.mail import Mail, Email, To, Content
 from functools import lru_cache
 from typing import Dict, Optional, Any
 
-def verificar_acesso():
-    if "autenticado" not in st.session_state:
-        st.session_state.autenticado = False
-
-    if not st.session_state.autenticado:
-        senha = st.text_input("Palavra-passe de acesso:", type="password")
-        if st.button("Entrar"):
-            if senha == "SuaSenhaForteAqui":  # Defina sua senha ou use st.secrets
-                st.session_state.autenticado = True
-                st.rerun()
-            else:
-                st.error("Palavra-passe incorreta.")
-        return False
-    return True
-
-if not verificar_acesso():
-    st.stop()  # Impede a execução do resto do app se não logado
-
-# O RESTO DO SEU APP CONTINUA AQUI NORMALMENTE...
-
 # Page configuration
 st.set_page_config(
     page_title="WarehouseApp",
