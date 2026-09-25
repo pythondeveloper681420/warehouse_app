@@ -32,26 +32,32 @@
 #     arquivo dentro de um try/except próprio.
 #   - Se um arquivo falhar, ele é marcado como "com erro", pulado, e o
 #     processamento CONTINUA normalmente para os demais arquivos do lote.
+#     NENHUM arquivo com problema interrompe o lote inteiro.
 #   - Todos os erros (arquivo, etapa, mensagem, traceback) são guardados em
 #     st.session_state.file_diagnostics e exibidos na aba "🛠️ Diagnóstico",
 #     junto com avisos de colunas obrigatórias ausentes por arquivo.
 #
-# NOVIDADE NESTA VERSÃO: ordem FIXA de colunas no arquivo final.
-#   - Em vez de simplesmente unir as colunas na ordem em que aparecem nos
-#     arquivos, o arquivo final agora segue a ordem definida em
-#     BASE_COLUMN_ORDER (colunas de origem) + COMPUTED_COLUMNS_ORDER
-#     (colunas calculadas), sempre nessa ordem.
-#   - Se algum arquivo do lote NÃO tiver uma dessas colunas, ela ainda
-#     aparece no resultado final, só que em branco para as linhas daquele
-#     arquivo.
-#   - Se algum arquivo tiver uma coluna com nome DIFERENTE de tudo que está
-#     na ordem padrão (uma coluna "extra"/desconhecida), ela é preservada e
-#     posicionada logo ANTES da coluna 'unique' (que continua sendo sempre
-#     a última coluna do arquivo).
-#
-# Continuam válidas as 3 passadas (mapear colunas -> agregar totais por PO
-# -> gravar arquivo final linha a linha) e o trade-off de não ordenar por
-# data (ordene no Excel/Sheets depois de baixar, se precisar).
+# =============================================================================
+# ORDEM FIXA DE COLUNAS (v3.0) — baseada no arquivo EXEMPLO fornecido
+# -----------------------------------------------------------------------------
+#   - FINAL_COLUMN_ORDER abaixo é a ordem EXATA de colunas do arquivo de
+#     exemplo (EXEMPLO.xlsx), na mesma sequência em que elas aparecem lá,
+#     já REMOVENDO duplicatas exatas de nome (quando o mesmo nome de coluna
+#     aparecia mais de uma vez no exemplo, mantemos apenas UMA ocorrência,
+#     na posição da primeira aparição).
+#   - O arquivo final SEMPRE sai com essas colunas, nessa ordem, mesmo que
+#     um arquivo de entrada específico não tenha alguma delas (nesse caso a
+#     célula fica em branco só para as linhas daquele arquivo).
+#   - 'unique' é sempre a ÚLTIMA coluna dentro de FINAL_COLUMN_ORDER.
+#   - Se algum arquivo do lote tiver uma coluna com nome que NÃO está em
+#     FINAL_COLUMN_ORDER (coluna nova/desconhecida), ela é preservada e
+#     posicionada DEPOIS de 'unique' (ou seja, no final de tudo) — nunca
+#     antes. Isso garante que a ordem fixa nunca seja quebrada.
+#   - Nenhuma coluna do arquivo é descartada: as conhecidas seguem a ordem
+#     fixa, as desconhecidas vão para o final, na ordem em que forem
+#     encontradas nos arquivos do lote.
+#   - Nenhum problema em um arquivo específico (coluna faltando, coluna
+#     extra, erro ao abrir etc.) interrompe o processamento dos demais.
 # =============================================================================
 
 import streamlit as st
@@ -89,7 +95,9 @@ PREVIEW_ROWS = 200  # quantas linhas mostrar na aba de Visualização
 # convertidas/limpas, não calculadas)
 NUMERIC_SOURCE_COLUMNS = [
     'Order Quantity', 'Net order value', 'PBXX Condition Amount',
-    'Price unit', 'Gross Price'
+    'Price unit', 'Gross Price', 'Value to be delivered', 'Value to be invoiced',
+    'PBXX Amount', 'Total GR Quantity', 'Quantity to be delivered',
+    'Delta PR Delivery', 'Delta PR Stat', 'Quantity Progress',
 ]
 
 # Colunas de data "de origem" que devem ser reformatadas para dd/mm/aaaa
@@ -97,7 +105,9 @@ DATE_COLUMNS = [
     'Delivery date', 'Last FUP',
     'Stat.-Rel. Del. Date', 'Delivery Date',
     'Requisition Date', 'Inspection Request Date',
-    'First Delivery Date', 'Purchase Requisition Delivery Date'
+    'First Delivery Date', 'Purchase Requisition Delivery Date',
+    'Inspection Requisition Date', 'Pending since', 'Next FUP',
+    'Estimated Arrival', 'Document Date',
 ]
 
 # Colunas de identificador que são normalizadas para inteiro
@@ -109,110 +119,107 @@ ID_COLUMNS = ['Purchasing Document', 'Item', 'Material']
 HEADER_SCAN_MAX_ROWS = 20
 
 # =============================================================================
-# ORDEM FIXA DAS COLUNAS DE ORIGEM (SAP) NO ARQUIVO FINAL
+# ORDEM FIXA E DEFINITIVA DAS COLUNAS NO ARQUIVO FINAL
 # -----------------------------------------------------------------------------
-# Essas colunas SEMPRE aparecem no arquivo final, nesta ordem exata — mesmo
-# que um arquivo específico não as tenha (nesse caso, ficam em branco para
-# as linhas daquele arquivo).
+# Extraída diretamente do cabeçalho do arquivo EXEMPLO.xlsx fornecido, na
+# mesma ordem, com duplicatas de nome removidas (mantendo a primeira
+# ocorrência). 'unique' é sempre a última coluna desta lista.
 # =============================================================================
-BASE_COLUMN_ORDER: List[str] = [
+FINAL_COLUMN_ORDER: List[str] = [
     'Purchasing Document',
     'Item',
+    'Supplier',
+    'Vendor',
     'Vendor Name',
     'Material Description',
-    'Status',
-    'Comment',
-    'Last FUP',
-    'Internal Contact',
-    'Estimated Arrival',
+    'Material',
+    'Control Code (NCM)',
+    'Order Quantity',
+    'Quantity to be delivered',
+    'Order Unit',
+    'Andritz WBS Element',
+    'Cost Center',
+    'Project Code',
+    'Purchase Requisition Delivery Date',
+    'Purchase Requisition',
     'Delivery date',
     'Stat.-Rel. Del. Date',
-    'Warn',
-    'Next FUP',
-    'Invoice #',
     'First Delivery Date',
+    'Requisition Date',
+    'PR Created by',
+    'Value to be delivered',
+    'Net order value',
     'Delta PR Delivery',
     'Delta PR Stat',
-    'Project Code',
-    'Andritz WBS Element',
+    'Total GR Quantity',
     'Document Date',
     'PO Created by',
-    'Material',
-    'Order Unit',
-    'Order Quantity',
-    'Total GR Quantity',
-    'Quantity to be delivered',
     'PO Created by ZP (partner role)',
-    'Value to be delivered',
-    'Purchase Requisition',
-    'PR Created by',
-    'Net order value',
-    'Requisition Date',
-    'Purchase Requisition Delivery Date',
-    'Vendor',
-    'Country',
-    'Incoterms',
-    'Incoterms (Part 2)',
-    'Currency',
-    'PBXX Condition Amount',
-    'Max. GR Document Date',
-    'Gross Price',
-    'Price unit',
-    'Order Price Unit',
-    'Terms of Payment',
-    'Inspection Plan',
     'Responsible',
-    'Cost Center',
+    'Suggested Responsible',
+    'Internal Contact',
+    'Quantity Progress Responsible',
+    'Plant',
+    'Planta',
+    'Plant 2',
+    'Country',
     'Region',
     'City',
-    'Pendente desde',
-    'Data atual',
-    'Dias pendentes',
-    'Notification Responsible',
-    'Pending since',
-    'Suggested Responsible',
-    'Control Code (NCM)',
-    'Purchasing Group',
-    'Storage location',
-    'Atraso',
-    'Grau de Criticidade',
-    'Tipo de Acompanhamento',
-    'Motivo de Atraso',
-    'Quantity Progress',
-    'Value to be invoiced',
-    'Supplier',
     'Country/Region Key',
+    'Currency',
+    'Incoterms',
+    'Incoterms (Part 2)',
+    'Next FUP',
+    'Estimated Arrival',
+    'Warn',
+    'Pending since',
+    'Invoice #',
+    'Value to be invoiced',
     'PBXX Amount',
-    'Payment terms',
-    'Plant',
+    'total_itens_po',
+    'valor_unitario',
+    'valor_item_com_impostos',
+    'total_valor_po_liquido',
+    'total_valor_po_com_impostos',
+    'valor_unitario_formatted',
+    'valor_item_com_impostos_formatted',
+    'Net order value_formatted',
+    'total_valor_po_liquido_formatted',
+    'total_valor_po_com_impostos_formatted',
+    'PO Creation Date',
+    'codigo_projeto',
+    'Purchasing Group',
+    'Quantity Progress',
     'Inspection Request Date',
+    'Inspection Plan',
     'Inspection Included',
     'Inspection Step',
     'Inspection Requisition Date',
     'Inspection Done',
     'Inspection Result',
     'Inspection Needed Days in Advance',
+    'Coluna1',
     'Acct Assignment Cat.',
     'Item Category',
     'Tax Code',
+    'Storage Location',
+    'Storage location',
+    'Payment terms',
+    'Payment Terms',
+    'Atraso',
+    'Grau de Criticidade',
+    'Column1',
+    'Comment',
+    'Status',
+    'Last FUP',
+    'unique',
 ]
 
-# Nomes de coluna conhecidos, usados só para RECONHECER com confiança qual
-# linha é o cabeçalho de verdade quando ele não está na linha 1.
-KNOWN_COLUMN_HINTS = (
-    set(BASE_COLUMN_ORDER) | set(NUMERIC_SOURCE_COLUMNS) | set(DATE_COLUMNS) | set(ID_COLUMNS)
-)
-
-# Colunas que PRECISAM existir no cabeçalho de cada arquivo para que os
-# cálculos façam sentido. Se faltarem, o arquivo ainda é processado (para
-# não travar o lote), mas um AVISO é registrado no diagnóstico, pois os
-# valores derivados daquela coluna sairão zerados/vazios para aquele arquivo.
-REQUIRED_COLUMNS = ['Purchasing Document', 'Item', 'Order Quantity', 'Net order value']
-
-# Colunas calculadas, na ordem em que devem aparecer ao final do arquivo
-# (sempre depois de BASE_COLUMN_ORDER e de eventuais colunas "extras").
-# 'unique' é, por definição, sempre a ÚLTIMA coluna do arquivo final.
-COMPUTED_COLUMNS_ORDER = [
+# Colunas calculadas (não existem nos arquivos de origem — são derivadas
+# durante o processamento). Todas já estão posicionadas corretamente dentro
+# de FINAL_COLUMN_ORDER; esta lista serve só para sabermos quais nomes NÃO
+# devem ser tratados como "coluna de origem" ao ler os arquivos de entrada.
+COMPUTED_COLUMN_NAMES: Set[str] = {
     'total_itens_po',
     'valor_unitario',
     'valor_item_com_impostos',
@@ -226,7 +233,17 @@ COMPUTED_COLUMNS_ORDER = [
     'PO Creation Date',
     'codigo_projeto',
     'unique',
-]
+}
+
+# Nomes de coluna conhecidos, usados só para RECONHECER com confiança qual
+# linha é o cabeçalho de verdade quando ele não está na linha 1.
+KNOWN_COLUMN_HINTS = set(FINAL_COLUMN_ORDER) | set(NUMERIC_SOURCE_COLUMNS) | set(DATE_COLUMNS) | set(ID_COLUMNS)
+
+# Colunas que PRECISAM existir no cabeçalho de cada arquivo para que os
+# cálculos façam sentido. Se faltarem, o arquivo ainda é processado (para
+# não travar o lote), mas um AVISO é registrado no diagnóstico, pois os
+# valores derivados daquela coluna sairão zerados/vazios para aquele arquivo.
+REQUIRED_COLUMNS = ['Purchasing Document', 'Item', 'Order Quantity', 'Net order value']
 
 
 # =============================================================================
@@ -354,10 +371,12 @@ def normalize_header(header_row: Tuple[Any, ...]) -> List[str]:
 
 
 def build_col_index(header: List[str]) -> Dict[str, int]:
-    """Mapa nome-da-coluna -> índice, ignorando colunas sem nome."""
+    """Mapa nome-da-coluna -> índice, ignorando colunas sem nome.
+    Em caso de nome duplicado dentro do MESMO arquivo, mantém a primeira
+    ocorrência (política consistente: '1 coluna com aquele nome')."""
     idx = {}
     for i, name in enumerate(header):
-        if name and name not in idx:  # mantém a primeira ocorrência em caso de nome duplicado
+        if name and name not in idx:
             idx[name] = i
     return idx
 
@@ -472,11 +491,11 @@ def build_master_columns(
     """
     União de todas as colunas de todos os arquivos válidos, na ordem em que
     aparecem (essa ordem "de aparição" só é usada depois para detectar quais
-    colunas são "extras", isto é, não fazem parte da ordem padrão fixa —
-    veja BASE_COLUMN_ORDER e COMPUTED_COLUMNS_ORDER). Arquivos que falharem
-    ao ter o cabeçalho lido são registrados em `diagnostics` e EXCLUÍDOS de
-    `valid_files` (que é retornado junto), para que as etapas seguintes nem
-    tentem reabri-los.
+    colunas são "extras", isto é, não fazem parte de FINAL_COLUMN_ORDER — ver
+    build_final_header). Arquivos que falharem ao ter o cabeçalho lido são
+    registrados em `diagnostics` e EXCLUÍDOS de `valid_files` (que é
+    retornado junto), para que as etapas seguintes nem tentem reabri-los.
+    Nenhum erro aqui interrompe o processamento dos demais arquivos do lote.
     """
     master_columns: List[str] = []
     seen: Set[str] = set()
@@ -538,6 +557,8 @@ def build_master_columns(
             })
 
         valid_files.append(f)
+        # Deduplica nomes repetidos dentro do PRÓPRIO cabeçalho do arquivo
+        # (mesma política de build_col_index: mantém a primeira ocorrência).
         for col in header:
             if col and col not in seen:
                 seen.add(col)
@@ -551,22 +572,18 @@ def build_final_header(master_columns: List[str]) -> Tuple[List[str], List[str]]
     Monta o cabeçalho final do arquivo de saída, respeitando a ordem FIXA
     pedida:
 
-        BASE_COLUMN_ORDER (sempre, nessa ordem, mesmo colunas ausentes
-        em todos os arquivos, que saem em branco)
-        + COMPUTED_COLUMNS_ORDER, exceto 'unique'
+        FINAL_COLUMN_ORDER (sempre, nessa ordem exata — termina em 'unique')
         + colunas "extras" (qualquer coluna encontrada em algum arquivo que
-          não faça parte de BASE_COLUMN_ORDER nem de COMPUTED_COLUMNS_ORDER),
-          na ordem em que foram encontradas
-        + 'unique' (sempre a última coluna)
+          não faça parte de FINAL_COLUMN_ORDER), na ordem em que foram
+          encontradas, sempre DEPOIS de 'unique'.
 
-    Retorna (final_header, extra_columns) — extra_columns é devolvido só
+    Retorna (final_header, extra_columns) — extra_columns é devolvido também
     para fins de diagnóstico/log.
     """
-    known_cols = set(BASE_COLUMN_ORDER) | set(COMPUTED_COLUMNS_ORDER)
+    known_cols = set(FINAL_COLUMN_ORDER)
     extra_columns = [c for c in master_columns if c not in known_cols]
-    computed_sem_unique = [c for c in COMPUTED_COLUMNS_ORDER if c != 'unique']
 
-    final_header = BASE_COLUMN_ORDER + computed_sem_unique + extra_columns + ['unique']
+    final_header = FINAL_COLUMN_ORDER + extra_columns
     return final_header, extra_columns
 
 
@@ -575,14 +592,11 @@ def build_final_header(master_columns: List[str]) -> Tuple[List[str], List[str]]
 # -----------------------------------------------------------------------------
 # A parte mais cara de todo o pipeline é abrir e converter o .xlsx original
 # em objetos Python (o openpyxl precisa descompactar o zip e parsear o XML
-# de cada linha). Na versão anterior isso era feito DUAS vezes por arquivo:
-# uma para calcular os totais por PO, outra para gravar as linhas finais.
-#
-# Aqui isso é feito em UMA única leitura: enquanto calculamos os totais,
-# já vamos gravando cada linha (via pickle, streaming, sem acumular nada em
-# memória) em um arquivo de cache local em disco. A etapa seguinte
-# (write_cached_rows) relê esse cache — muito mais rápido que reabrir o
-# .xlsx original — em vez de reparsear o arquivo do zero.
+# de cada linha). Fazer isso em UMA única leitura por arquivo (em vez de
+# duas): enquanto calculamos os totais, já vamos gravando cada linha (via
+# pickle, streaming, sem acumular nada em memória) em um arquivo de cache
+# local em disco. A etapa seguinte (write_file_rows / open_cached_rows) relê
+# esse cache — muito mais rápido que reabrir o .xlsx original.
 # =============================================================================
 
 def aggregate_and_cache_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
@@ -682,14 +696,9 @@ def write_file_rows(cache_path: str, ws_out: Any, final_header: List[str],
     de saída (write_only), sem acumular o resultado em memória. Retorna o
     número de linhas gravadas.
 
-    Ler do cache em vez de reabrir o .xlsx original é o que torna esta etapa
-    rápida: o .xlsx original já foi parseado (a parte cara) uma única vez,
-    na etapa anterior.
-
     A linha gravada segue exatamente `final_header`: qualquer coluna que
-    não exista neste arquivo específico (ex: colunas de BASE_COLUMN_ORDER
-    ausentes, ou colunas "extras" vindas de outro arquivo do lote) sai em
-    branco para essas linhas — nunca desalinha ou encurta a linha.
+    não exista neste arquivo específico sai em branco para essas linhas —
+    nunca desalinha ou encurta a linha.
 
     Pode lançar exceção — o chamador (process_files) é responsável por
     isolar a falha por arquivo.
@@ -702,8 +711,10 @@ def write_file_rows(cache_path: str, ws_out: Any, final_header: List[str],
 
     # Só processamos colunas que este arquivo de fato possui — mas a
     # linha final sempre é montada respeitando `final_header` por
-    # completo (colunas ausentes ficam em branco via out_row.get).
-    file_columns = [c for c in header if c]
+    # completo (colunas ausentes ficam em branco via out_row.get). Nomes
+    # de colunas calculadas nunca vêm do arquivo de origem, então são
+    # excluídos aqui para não conflitar com os valores derivados abaixo.
+    file_columns = [c for c in header if c and c not in COMPUTED_COLUMN_NAMES]
 
     try:
         for row in rows_iter:
@@ -740,7 +751,7 @@ def write_file_rows(cache_path: str, ws_out: Any, final_header: List[str],
                 vendor_names_seen.add(str(vendor_name))
 
             # Monta a linha de saída com TODAS as colunas deste arquivo
-            # (origem) + calculadas. Colunas de BASE_COLUMN_ORDER que este
+            # (origem) + calculadas. Colunas de FINAL_COLUMN_ORDER que este
             # arquivo não tem simplesmente não entram aqui, e por isso saem
             # em branco na hora do append final (out_row.get(col, '')).
             out_row: Dict[str, Any] = {}
@@ -824,6 +835,9 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
     arquivo temporário em disco. Retorna um dicionário com o caminho do
     arquivo final, as métricas calculadas e a lista de diagnósticos
     (erros/avisos por arquivo) encontrados ao longo do processamento.
+
+    Nenhum arquivo com problema interrompe o lote: cada etapa isola a falha
+    e segue para o próximo arquivo.
     """
     diagnostics: List[Dict[str, str]] = []
     n_files = len(uploaded_files)
@@ -840,8 +854,8 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
             'tipo': 'aviso',
             'mensagem': (
                 "Colunas encontradas nos arquivos que não fazem parte da ordem "
-                f"padrão foram preservadas e posicionadas antes de 'unique': "
-                f"{', '.join(extra_columns)}."
+                f"padrão foram preservadas e posicionadas DEPOIS de 'unique', "
+                f"no final do arquivo: {', '.join(extra_columns)}."
             ),
         })
 
@@ -998,10 +1012,10 @@ def main():
         "Processamento em lote: cada arquivo é lido e liberado da memória um de "
         "cada vez, e o resultado é gravado em disco linha a linha — sem manter "
         "todos os dados na RAM de uma vez. O arquivo final segue sempre a mesma "
-        "ordem fixa de colunas; colunas ausentes em algum arquivo saem em branco, "
-        "e colunas extras/desconhecidas aparecem logo antes de 'unique'. "
-        "Se um arquivo específico tiver problema, ele é isolado e reportado, sem "
-        "derrubar o processamento dos demais."
+        "ordem fixa de colunas (baseada no arquivo de exemplo); colunas ausentes "
+        "em algum arquivo saem em branco, e colunas extras/desconhecidas aparecem "
+        "depois de 'unique', no final do arquivo. Se um arquivo específico tiver "
+        "problema, ele é isolado e reportado, sem derrubar o processamento dos demais."
     )
     tab1, tab2, tab3, tab4 = st.tabs([
         "📤 Upload e Extração", "📊 Visualização de Dados", "🛠️ Diagnóstico", "❓ Como Utilizar"
@@ -1180,15 +1194,19 @@ def main():
            - Cada arquivo é aberto, processado e liberado da memória antes do próximo
            - Se UM arquivo falhar em qualquer etapa, ele é isolado e reportado na aba
              "🛠️ Diagnóstico" — os demais arquivos do lote continuam sendo processados
+             normalmente, sem nenhuma interrupção do lote inteiro
 
-        3. **Ordem das colunas no arquivo final (FIXA)**
+        3. **Ordem das colunas no arquivo final (FIXA, baseada no arquivo de exemplo)**
            - O arquivo final sempre segue a mesma ordem de colunas, independente
              da ordem em que elas apareçam nos arquivos enviados.
+           - Se um nome de coluna aparecia repetido no exemplo (com o mesmo
+             significado), ele entra apenas UMA vez no arquivo final.
            - Se algum arquivo do lote não tiver uma dessas colunas, ela ainda
              aparece no resultado — só que em branco para as linhas daquele arquivo.
            - Se algum arquivo tiver uma coluna com nome diferente de tudo que está
-             na ordem padrão, ela é preservada e posicionada logo **antes** da
-             coluna `unique`, que é sempre a última coluna do arquivo.
+             na ordem padrão, ela é preservada e posicionada **depois** da
+             coluna `unique`, no final de tudo — nunca antes e nunca quebrando a
+             ordem fixa das demais colunas.
 
         4. **Visualização**
            - Acesse a aba "Visualização de Dados"
@@ -1201,7 +1219,9 @@ def main():
              encontradas fora da ordem padrão).
 
         ### Estrutura esperada da planilha (por arquivo)
-        - Cabeçalho **exatamente na linha 1** (sem título, logo ou linhas em branco acima)
+        - Cabeçalho **exatamente na linha 1** (sem título, logo ou linhas em branco acima) —
+          mas o sistema também consegue localizar o cabeçalho automaticamente se ele
+          estiver um pouco mais abaixo
         - Nenhuma célula mesclada na linha de cabeçalho
         - Colunas obrigatórias presentes, com esses nomes exatos:
           `Purchasing Document`, `Item`, `Order Quantity`, `Net order value`
@@ -1233,9 +1253,9 @@ def main():
              e o motivo exato aparece na aba Diagnóstico.
 
         5. **E se um arquivo tiver uma coluna com nome que não existe nos outros?**
-           - Ela é preservada no arquivo final, posicionada logo antes da coluna
-             `unique`. Um aviso é registrado na aba Diagnóstico listando quais
-             colunas extras foram encontradas.
+           - Ela é preservada no arquivo final, posicionada logo DEPOIS da coluna
+             `unique` (no final de tudo). Um aviso é registrado na aba Diagnóstico
+             listando quais colunas extras foram encontradas.
 
         6. **Dados processados são salvos?**
            - O arquivo final fica em um arquivo temporário no servidor durante a sessão
@@ -1256,7 +1276,7 @@ if __name__ == "__main__":
     st.markdown(
         """
         <div style='text-align: center'>
-            <p>Desenvolvido com ❤️ | PO Processor Pro v2.2 (ordem fixa de colunas)</p>
+            <p>Desenvolvido com ❤️ | PO Processor Pro v3.0 (ordem fixa baseada no exemplo)</p>
         </div>
         """,
         unsafe_allow_html=True
