@@ -27,13 +27,7 @@
 # "read_only" (leitura linha a linha) e grava o resultado direto em disco em
 # modo "write_only" (também linha a linha) — sem nunca carregar tudo na RAM.
 #
-# NOVIDADE NESTA VERSÃO: isolamento de falhas por arquivo.
-# Antes, se QUALQUER arquivo do lote desse um erro inesperado (arquivo
-# corrompido, protegido por senha, formato antigo .xls renomeado para
-# .xlsx, cabeçalho fora da linha 1, etc.), o processamento inteiro era
-# abortado e o usuário só via um aviso genérico, sem saber qual arquivo ou
-# por quê. Agora:
-#
+# Isolamento de falhas por arquivo:
 #   - Cada etapa (mapear colunas / agregar totais / gravar linhas) roda por
 #     arquivo dentro de um try/except próprio.
 #   - Se um arquivo falhar, ele é marcado como "com erro", pulado, e o
@@ -42,13 +36,22 @@
 #     st.session_state.file_diagnostics e exibidos na aba "🛠️ Diagnóstico",
 #     junto com avisos de colunas obrigatórias ausentes por arquivo.
 #
+# NOVIDADE NESTA VERSÃO: ordem FIXA de colunas no arquivo final.
+#   - Em vez de simplesmente unir as colunas na ordem em que aparecem nos
+#     arquivos, o arquivo final agora segue a ordem definida em
+#     BASE_COLUMN_ORDER (colunas de origem) + COMPUTED_COLUMNS_ORDER
+#     (colunas calculadas), sempre nessa ordem.
+#   - Se algum arquivo do lote NÃO tiver uma dessas colunas, ela ainda
+#     aparece no resultado final, só que em branco para as linhas daquele
+#     arquivo.
+#   - Se algum arquivo tiver uma coluna com nome DIFERENTE de tudo que está
+#     na ordem padrão (uma coluna "extra"/desconhecida), ela é preservada e
+#     posicionada logo ANTES da coluna 'unique' (que continua sendo sempre
+#     a última coluna do arquivo).
+#
 # Continuam válidas as 3 passadas (mapear colunas -> agregar totais por PO
 # -> gravar arquivo final linha a linha) e o trade-off de não ordenar por
 # data (ordene no Excel/Sheets depois de baixar, se precisar).
-#
-# TODAS as colunas originais de cada arquivo continuam preservadas no
-# arquivo final (união das colunas de todos os arquivos enviados que foram
-# processados com sucesso), mais as colunas calculadas ao final.
 # =============================================================================
 
 import streamlit as st
@@ -104,14 +107,100 @@ ID_COLUMNS = ['Purchasing Document', 'Item', 'Material']
 # título/logo (comum em relatórios exportados do SAP GUI).
 HEADER_SCAN_MAX_ROWS = 20
 
+# =============================================================================
+# ORDEM FIXA DAS COLUNAS DE ORIGEM (SAP) NO ARQUIVO FINAL
+# -----------------------------------------------------------------------------
+# Essas colunas SEMPRE aparecem no arquivo final, nesta ordem exata — mesmo
+# que um arquivo específico não as tenha (nesse caso, ficam em branco para
+# as linhas daquele arquivo).
+# =============================================================================
+BASE_COLUMN_ORDER: List[str] = [
+    'Purchasing Document',
+    'Item',
+    'Vendor Name',
+    'Material Description',
+    'Status',
+    'Comment',
+    'Last FUP',
+    'Internal Contact',
+    'Estimated Arrival',
+    'Delivery date',
+    'Stat.-Rel. Del. Date',
+    'Warn',
+    'Next FUP',
+    'Invoice #',
+    'First Delivery Date',
+    'Delta PR Delivery',
+    'Delta PR Stat',
+    'Project Code',
+    'Andritz WBS Element',
+    'Document Date',
+    'PO Created by',
+    'Material',
+    'Order Unit',
+    'Order Quantity',
+    'Total GR Quantity',
+    'Quantity to be delivered',
+    'PO Created by ZP (partner role)',
+    'Value to be delivered',
+    'Purchase Requisition',
+    'PR Created by',
+    'Net order value',
+    'Requisition Date',
+    'Purchase Requisition Delivery Date',
+    'Vendor',
+    'Country',
+    'Incoterms',
+    'Incoterms (Part 2)',
+    'Currency',
+    'PBXX Condition Amount',
+    'Max. GR Document Date',
+    'Gross Price',
+    'Price unit',
+    'Order Price Unit',
+    'Terms of Payment',
+    'Inspection Plan',
+    'Responsible',
+    'Cost Center',
+    'Region',
+    'City',
+    'Pendente desde',
+    'Data atual',
+    'Dias pendentes',
+    'Notification Responsible',
+    'Pending since',
+    'Suggested Responsible',
+    'Control Code (NCM)',
+    'Purchasing Group',
+    'Storage location',
+    'Atraso',
+    'Grau de Criticidade',
+    'Tipo de Acompanhamento',
+    'Motivo de Atraso',
+    'Quantity Progress',
+    'Value to be invoiced',
+    'Supplier',
+    'Country/Region Key',
+    'PBXX Amount',
+    'Payment terms',
+    'Plant',
+    'Inspection Request Date',
+    'Inspection Included',
+    'Inspection Step',
+    'Inspection Requisition Date',
+    'Inspection Done',
+    'Inspection Result',
+    'Inspection Needed Days in Advance',
+    'Acct Assignment Cat.',
+    'Item Category',
+    'Tax Code',
+]
+
 # Nomes de coluna conhecidos, usados só para RECONHECER com confiança qual
 # linha é o cabeçalho de verdade quando ele não está na linha 1.
-KNOWN_COLUMN_HINTS = {
-    'Purchasing Document', 'Item', 'Purchasing Group', 'Vendor Name', 'Vendor',
-    'Supplier', 'Material', 'Material Description', 'Status', 'Comment',
-    'Order Quantity', 'Net order value', 'PBXX Condition Amount', 'PBXX Amount',
-    'Price unit', 'Gross Price', 'Document Date', 'Andritz WBS Element',
-} | set(NUMERIC_SOURCE_COLUMNS) | set(DATE_COLUMNS) | set(ID_COLUMNS)
+KNOWN_COLUMN_HINTS = (
+    set(BASE_COLUMN_ORDER) | set(NUMERIC_SOURCE_COLUMNS) | set(DATE_COLUMNS) | set(ID_COLUMNS)
+)
 
 # Colunas que PRECISAM existir no cabeçalho de cada arquivo para que os
 # cálculos façam sentido. Se faltarem, o arquivo ainda é processado (para
@@ -119,8 +208,9 @@ KNOWN_COLUMN_HINTS = {
 # valores derivados daquela coluna sairão zerados/vazios para aquele arquivo.
 REQUIRED_COLUMNS = ['Purchasing Document', 'Item', 'Order Quantity', 'Net order value']
 
-# Colunas calculadas que são adicionadas ao final do arquivo, na ordem abaixo
-# (qualquer uma que já exista como coluna original não é duplicada)
+# Colunas calculadas, na ordem em que devem aparecer ao final do arquivo
+# (sempre depois de BASE_COLUMN_ORDER e de eventuais colunas "extras").
+# 'unique' é, por definição, sempre a ÚLTIMA coluna do arquivo final.
 COMPUTED_COLUMNS_ORDER = [
     'total_itens_po',
     'valor_unitario',
@@ -380,9 +470,12 @@ def build_master_columns(
 ) -> Tuple[List[str], List[Any]]:
     """
     União de todas as colunas de todos os arquivos válidos, na ordem em que
-    aparecem. Arquivos que falharem ao ter o cabeçalho lido são registrados
-    em `diagnostics` e EXCLUÍDOS de `valid_files` (que é retornado junto),
-    para que as etapas seguintes nem tentem reabri-los.
+    aparecem (essa ordem "de aparição" só é usada depois para detectar quais
+    colunas são "extras", isto é, não fazem parte da ordem padrão fixa —
+    veja BASE_COLUMN_ORDER e COMPUTED_COLUMNS_ORDER). Arquivos que falharem
+    ao ter o cabeçalho lido são registrados em `diagnostics` e EXCLUÍDOS de
+    `valid_files` (que é retornado junto), para que as etapas seguintes nem
+    tentem reabri-los.
     """
     master_columns: List[str] = []
     seen: Set[str] = set()
@@ -452,6 +545,30 @@ def build_master_columns(
     return master_columns, valid_files
 
 
+def build_final_header(master_columns: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Monta o cabeçalho final do arquivo de saída, respeitando a ordem FIXA
+    pedida:
+
+        BASE_COLUMN_ORDER (sempre, nessa ordem, mesmo colunas ausentes
+        em todos os arquivos, que saem em branco)
+        + COMPUTED_COLUMNS_ORDER, exceto 'unique'
+        + colunas "extras" (qualquer coluna encontrada em algum arquivo que
+          não faça parte de BASE_COLUMN_ORDER nem de COMPUTED_COLUMNS_ORDER),
+          na ordem em que foram encontradas
+        + 'unique' (sempre a última coluna)
+
+    Retorna (final_header, extra_columns) — extra_columns é devolvido só
+    para fins de diagnóstico/log.
+    """
+    known_cols = set(BASE_COLUMN_ORDER) | set(COMPUTED_COLUMNS_ORDER)
+    extra_columns = [c for c in master_columns if c not in known_cols]
+    computed_sem_unique = [c for c in COMPUTED_COLUMNS_ORDER if c != 'unique']
+
+    final_header = BASE_COLUMN_ORDER + computed_sem_unique + extra_columns + ['unique']
+    return final_header, extra_columns
+
+
 # =============================================================================
 # PASSADA 1 — agregar totais por Pedido de Compra (PO), um arquivo de cada vez
 # =============================================================================
@@ -512,14 +629,20 @@ def aggregate_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
 # PASSADA 2 — gravar o arquivo final, linha a linha, direto em disco
 # =============================================================================
 
-def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
-                     final_header: List[str], po_totals: Dict[int, Dict[str, float]],
+def write_file_rows(uploaded_file: Any, ws_out: Any, final_header: List[str],
+                     po_totals: Dict[int, Dict[str, float]],
                      seen_keys: Set[Tuple[Optional[int], Optional[int]]],
                      vendor_names_seen: Set[str]) -> int:
     """
     Percorre um arquivo linha a linha, calcula as colunas derivadas e grava
     cada linha diretamente na planilha de saída (write_only), sem acumular
     o resultado em memória. Retorna o número de linhas gravadas.
+
+    A linha gravada segue exatamente `final_header`: qualquer coluna que
+    não exista neste arquivo específico (ex: colunas de BASE_COLUMN_ORDER
+    ausentes, ou colunas "extras" vindas de outro arquivo do lote) sai em
+    branco para essas linhas — nunca desalinha ou encurta a linha.
+
     Pode lançar exceção — o chamador (process_files) é responsável por
     isolar a falha por arquivo.
     """
@@ -532,6 +655,11 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
         if header_idx == -1:
             return 0
         col_idx = build_col_index(header)
+
+        # Só processamos colunas que este arquivo de fato possui — mas a
+        # linha final sempre é montada respeitando `final_header` por
+        # completo (colunas ausentes ficam em branco via out_row.get).
+        file_columns = [c for c in header if c]
 
         for row in rows_iter:
             raw_po = get_cell(row, col_idx, 'Purchasing Document')
@@ -566,9 +694,12 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
             if vendor_name:
                 vendor_names_seen.add(str(vendor_name))
 
-            # Monta a linha de saída com TODAS as colunas originais + calculadas
+            # Monta a linha de saída com TODAS as colunas deste arquivo
+            # (origem) + calculadas. Colunas de BASE_COLUMN_ORDER que este
+            # arquivo não tem simplesmente não entram aqui, e por isso saem
+            # em branco na hora do append final (out_row.get(col, '')).
             out_row: Dict[str, Any] = {}
-            for col in master_columns:
+            for col in file_columns:
                 val = get_cell(row, col_idx, col)
                 if col in DATE_COLUMNS:
                     dt = parse_date_value(val)
@@ -581,13 +712,8 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, master_columns: List[str],
                     val = item_id
                 elif col == 'Material':
                     val = material_id
-                # IMPORTANTE: nunca deixar None aqui. dict.get(col, '') só usa
-                # o fallback '' quando a CHAVE não existe — como a chave é
-                # sempre atribuída (mesmo quando o valor da célula é None,
-                # por exemplo quando este arquivo não tem essa coluna), sem
-                # essa conversão a linha gravada ficava mais curta que o
-                # cabeçalho final e o preview quebrava ao montar o DataFrame
-                # ("N columns passed, passed data had M columns").
+                # IMPORTANTE: nunca deixar None aqui, senão a linha gravada
+                # fica mais curta/desalinhada em relação ao cabeçalho final.
                 if val is None:
                     val = ''
                 out_row[col] = val
@@ -662,7 +788,20 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
     # --- Passada 0: mapear colunas -----------------------------------------
     status_placeholder.info("🔎 Etapa 1/3 — Mapeando colunas dos arquivos...")
     master_columns, valid_files = build_master_columns(uploaded_files, diagnostics)
-    final_header = master_columns + [c for c in COMPUTED_COLUMNS_ORDER if c not in master_columns]
+    final_header, extra_columns = build_final_header(master_columns)
+
+    if extra_columns:
+        diagnostics.append({
+            'arquivo': '(vários arquivos)',
+            'etapa': 'Etapa 1 — Mapeamento de colunas',
+            'tipo': 'aviso',
+            'mensagem': (
+                "Colunas encontradas nos arquivos que não fazem parte da ordem "
+                f"padrão foram preservadas e posicionadas antes de 'unique': "
+                f"{', '.join(extra_columns)}."
+            ),
+        })
+
     progress_bar.progress(0.05)
 
     if not valid_files:
@@ -720,7 +859,7 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
         )
         try:
             total_rows_written += write_file_rows(
-                f, ws_out, master_columns, final_header, po_totals, seen_keys_write, vendor_names_seen
+                f, ws_out, final_header, po_totals, seen_keys_write, vendor_names_seen
             )
             files_ok_write += 1
         except Exception as e:
@@ -797,7 +936,9 @@ def main():
     st.caption(
         "Processamento em lote: cada arquivo é lido e liberado da memória um de "
         "cada vez, e o resultado é gravado em disco linha a linha — sem manter "
-        "todos os dados na RAM de uma vez. Todas as colunas originais são preservadas. "
+        "todos os dados na RAM de uma vez. O arquivo final segue sempre a mesma "
+        "ordem fixa de colunas; colunas ausentes em algum arquivo saem em branco, "
+        "e colunas extras/desconhecidas aparecem logo antes de 'unique'. "
         "Se um arquivo específico tiver problema, ele é isolado e reportado, sem "
         "derrubar o processamento dos demais."
     )
@@ -937,7 +1078,8 @@ def main():
             st.info(
                 "Nenhum erro ou aviso registrado ainda. Depois de rodar o processamento, "
                 "qualquer arquivo com problema (corrompido, protegido por senha, coluna "
-                "obrigatória ausente, etc.) vai aparecer detalhado aqui."
+                "obrigatória ausente, coluna extra fora da ordem padrão, etc.) vai "
+                "aparecer detalhado aqui."
             )
         else:
             if diags:
@@ -978,14 +1120,24 @@ def main():
            - Se UM arquivo falhar em qualquer etapa, ele é isolado e reportado na aba
              "🛠️ Diagnóstico" — os demais arquivos do lote continuam sendo processados
 
-        3. **Visualização**
+        3. **Ordem das colunas no arquivo final (FIXA)**
+           - O arquivo final sempre segue a mesma ordem de colunas, independente
+             da ordem em que elas apareçam nos arquivos enviados.
+           - Se algum arquivo do lote não tiver uma dessas colunas, ela ainda
+             aparece no resultado — só que em branco para as linhas daquele arquivo.
+           - Se algum arquivo tiver uma coluna com nome diferente de tudo que está
+             na ordem padrão, ela é preservada e posicionada logo **antes** da
+             coluna `unique`, que é sempre a última coluna do arquivo.
+
+        4. **Visualização**
            - Acesse a aba "Visualização de Dados"
            - Veja as métricas gerais e uma prévia das primeiras {PREVIEW_ROWS} linhas
 
-        4. **Diagnóstico**
+        5. **Diagnóstico**
            - Sempre que algo não sair 100% como esperado, confira essa aba antes de
              qualquer outra coisa — ela mostra exatamente qual arquivo, em qual etapa,
-             e qual foi o erro ou aviso.
+             e qual foi o erro ou aviso (inclusive avisos sobre colunas extras
+             encontradas fora da ordem padrão).
 
         ### Estrutura esperada da planilha (por arquivo)
         - Cabeçalho **exatamente na linha 1** (sem título, logo ou linhas em branco acima)
@@ -1019,7 +1171,12 @@ def main():
            - Esse arquivo específico é excluído do resultado (não trava o lote inteiro),
              e o motivo exato aparece na aba Diagnóstico.
 
-        5. **Dados processados são salvos?**
+        5. **E se um arquivo tiver uma coluna com nome que não existe nos outros?**
+           - Ela é preservada no arquivo final, posicionada logo antes da coluna
+             `unique`. Um aviso é registrado na aba Diagnóstico listando quais
+             colunas extras foram encontradas.
+
+        6. **Dados processados são salvos?**
            - O arquivo final fica em um arquivo temporário no servidor durante a sessão
              e é removido ao clicar em "Limpar e Voltar ao Início" (ou ao reiniciar a sessão).
         """)
@@ -1038,7 +1195,7 @@ if __name__ == "__main__":
     st.markdown(
         """
         <div style='text-align: center'>
-            <p>Desenvolvido com ❤️ | PO Processor Pro v2.1 (isolamento de falhas por arquivo)</p>
+            <p>Desenvolvido com ❤️ | PO Processor Pro v2.2 (ordem fixa de colunas)</p>
         </div>
         """,
         unsafe_allow_html=True
