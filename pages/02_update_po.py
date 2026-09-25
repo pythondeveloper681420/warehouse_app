@@ -64,6 +64,7 @@ import re
 import traceback
 import tempfile
 import zipfile
+import pickle
 import logging
 from typing import List, Optional, Any, Dict, Set, Tuple
 
@@ -570,17 +571,30 @@ def build_final_header(master_columns: List[str]) -> Tuple[List[str], List[str]]
 
 
 # =============================================================================
-# PASSADA 1 — agregar totais por Pedido de Compra (PO), um arquivo de cada vez
+# PASSADA 1 — agregar totais por PO E gravar um cache local, em UMA só leitura
+# -----------------------------------------------------------------------------
+# A parte mais cara de todo o pipeline é abrir e converter o .xlsx original
+# em objetos Python (o openpyxl precisa descompactar o zip e parsear o XML
+# de cada linha). Na versão anterior isso era feito DUAS vezes por arquivo:
+# uma para calcular os totais por PO, outra para gravar as linhas finais.
+#
+# Aqui isso é feito em UMA única leitura: enquanto calculamos os totais,
+# já vamos gravando cada linha (via pickle, streaming, sem acumular nada em
+# memória) em um arquivo de cache local em disco. A etapa seguinte
+# (write_cached_rows) relê esse cache — muito mais rápido que reabrir o
+# .xlsx original — em vez de reparsear o arquivo do zero.
 # =============================================================================
 
-def aggregate_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
-                    seen_keys: Set[Tuple[Optional[int], Optional[int]]]) -> int:
+def aggregate_and_cache_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
+                              seen_keys: Set[Tuple[Optional[int], Optional[int]]],
+                              cache_path: str) -> int:
     """
-    Percorre um arquivo linha a linha e acumula os totais por PO em `po_totals`.
-    `seen_keys` evita contar a mesma linha (mesmo PO+Item) duas vezes.
-    Retorna o número de linhas válidas processadas (para métricas/log).
-    Pode lançar exceção — o chamador (process_files) é responsável por
-    isolar a falha por arquivo.
+    Lê o arquivo original UMA vez: acumula os totais por PO em `po_totals`
+    e, ao mesmo tempo, grava o cabeçalho + cada linha bruta em `cache_path`
+    (formato pickle, uma leitura/gravação em streaming, custo de memória
+    desprezível). `seen_keys` evita contar a mesma linha (mesmo PO+Item)
+    duas vezes. Retorna o número de linhas válidas processadas (métricas).
+    Pode lançar exceção — o chamador (process_files) isola a falha por arquivo.
     """
     uploaded_file.seek(0)
     wb = load_workbook(uploaded_file, read_only=True, data_only=True)
@@ -588,55 +602,89 @@ def aggregate_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
     try:
         ws = wb.worksheets[0]
         header, rows_iter, header_idx = locate_header_and_rows(ws)
-        if header_idx == -1:
-            return 0
-        col_idx = build_col_index(header)
+        with open(cache_path, 'wb') as cache_f:
+            pickle.dump(header, cache_f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        for row in rows_iter:
-            raw_po = get_cell(row, col_idx, 'Purchasing Document')
-            # Replica o filtro original: descarta a linha se o Purchasing
-            # Document veio como texto (ex: linhas de rodapé/total).
-            if isinstance(raw_po, str):
-                continue
-            po_id = parse_id(raw_po)
-            if po_id is None:
-                continue
+            if header_idx == -1:
+                return 0
+            col_idx = build_col_index(header)
 
-            item_id = parse_id(get_cell(row, col_idx, 'Item'))
-            key = (po_id, item_id)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
+            for row in rows_iter:
+                pickle.dump(row, cache_f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            qty = to_number(get_cell(row, col_idx, 'Order Quantity', 0))
-            net_value = to_number(get_cell(row, col_idx, 'Net order value', 0))
-            pbxx = to_number(get_cell(row, col_idx, 'PBXX Condition Amount', 0))
-            valor_item_com_impostos = pbxx * qty
+                raw_po = get_cell(row, col_idx, 'Purchasing Document')
+                # Replica o filtro original: descarta a linha se o Purchasing
+                # Document veio como texto (ex: linhas de rodapé/total).
+                if isinstance(raw_po, str):
+                    continue
+                po_id = parse_id(raw_po)
+                if po_id is None:
+                    continue
 
-            entry = po_totals.setdefault(po_id, {'net': 0.0, 'com_impostos': 0.0, 'qty': 0.0})
-            entry['net'] += net_value
-            entry['com_impostos'] += valor_item_com_impostos
-            entry['qty'] += qty
-            processed += 1
+                item_id = parse_id(get_cell(row, col_idx, 'Item'))
+                key = (po_id, item_id)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                qty = to_number(get_cell(row, col_idx, 'Order Quantity', 0))
+                net_value = to_number(get_cell(row, col_idx, 'Net order value', 0))
+                pbxx = to_number(get_cell(row, col_idx, 'PBXX Condition Amount', 0))
+                valor_item_com_impostos = pbxx * qty
+
+                entry = po_totals.setdefault(po_id, {'net': 0.0, 'com_impostos': 0.0, 'qty': 0.0})
+                entry['net'] += net_value
+                entry['com_impostos'] += valor_item_com_impostos
+                entry['qty'] += qty
+                processed += 1
     finally:
         wb.close()
         uploaded_file.seek(0)
-        gc.collect()
     return processed
+
+
+def open_cached_rows(cache_path: str) -> Tuple[List[str], Any]:
+    """Abre o cache pickle gravado por aggregate_and_cache_file e retorna
+    (header, gerador_de_linhas), lendo uma linha por vez (sem carregar tudo
+    na memória). O arquivo de cache é fechado automaticamente quando o
+    gerador é totalmente consumido."""
+    cache_f = open(cache_path, 'rb')
+    try:
+        header = pickle.load(cache_f)
+    except EOFError:
+        cache_f.close()
+        return [], iter(())
+
+    def _rows():
+        try:
+            while True:
+                try:
+                    yield pickle.load(cache_f)
+                except EOFError:
+                    return
+        finally:
+            cache_f.close()
+
+    return header, _rows()
 
 
 # =============================================================================
 # PASSADA 2 — gravar o arquivo final, linha a linha, direto em disco
 # =============================================================================
 
-def write_file_rows(uploaded_file: Any, ws_out: Any, final_header: List[str],
+def write_file_rows(cache_path: str, ws_out: Any, final_header: List[str],
                      po_totals: Dict[int, Dict[str, float]],
                      seen_keys: Set[Tuple[Optional[int], Optional[int]]],
                      vendor_names_seen: Set[str]) -> int:
     """
-    Percorre um arquivo linha a linha, calcula as colunas derivadas e grava
-    cada linha diretamente na planilha de saída (write_only), sem acumular
-    o resultado em memória. Retorna o número de linhas gravadas.
+    Relê o cache local (gravado por aggregate_and_cache_file) linha a linha,
+    calcula as colunas derivadas e grava cada linha diretamente na planilha
+    de saída (write_only), sem acumular o resultado em memória. Retorna o
+    número de linhas gravadas.
+
+    Ler do cache em vez de reabrir o .xlsx original é o que torna esta etapa
+    rápida: o .xlsx original já foi parseado (a parte cara) uma única vez,
+    na etapa anterior.
 
     A linha gravada segue exatamente `final_header`: qualquer coluna que
     não exista neste arquivo específico (ex: colunas de BASE_COLUMN_ORDER
@@ -646,21 +694,18 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, final_header: List[str],
     Pode lançar exceção — o chamador (process_files) é responsável por
     isolar a falha por arquivo.
     """
-    uploaded_file.seek(0)
-    wb = load_workbook(uploaded_file, read_only=True, data_only=True)
     written = 0
+    header, rows_iter = open_cached_rows(cache_path)
+    if not header:
+        return 0
+    col_idx = build_col_index(header)
+
+    # Só processamos colunas que este arquivo de fato possui — mas a
+    # linha final sempre é montada respeitando `final_header` por
+    # completo (colunas ausentes ficam em branco via out_row.get).
+    file_columns = [c for c in header if c]
+
     try:
-        ws = wb.worksheets[0]
-        header, rows_iter, header_idx = locate_header_and_rows(ws)
-        if header_idx == -1:
-            return 0
-        col_idx = build_col_index(header)
-
-        # Só processamos colunas que este arquivo de fato possui — mas a
-        # linha final sempre é montada respeitando `final_header` por
-        # completo (colunas ausentes ficam em branco via out_row.get).
-        file_columns = [c for c in header if c]
-
         for row in rows_iter:
             raw_po = get_cell(row, col_idx, 'Purchasing Document')
             if isinstance(raw_po, str):
@@ -735,9 +780,7 @@ def write_file_rows(uploaded_file: Any, ws_out: Any, final_header: List[str],
             ws_out.append([out_row.get(col, '') for col in final_header])
             written += 1
     finally:
-        wb.close()
-        uploaded_file.seek(0)
-        gc.collect()
+        rows_iter.close()
     return written
 
 
@@ -816,64 +859,82 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
             'files_total': n_files,
         }
 
-    # --- Passada 1: agregar totais por PO -----------------------------------
+    # --- Passada 1: agregar totais por PO + gravar cache local em disco ------
+    # (leitura ÚNICA do .xlsx original de cada arquivo — ver comentário em
+    # aggregate_and_cache_file sobre por que isso é bem mais rápido)
     po_totals: Dict[int, Dict[str, float]] = {}
     seen_keys_agg: Set[Tuple[Optional[int], Optional[int]]] = set()
     files_ok_agg: List[Any] = []
-    for idx, f in enumerate(valid_files):
-        status_placeholder.info(
-            f"➕ Etapa 2/3 — Calculando totais por PO... arquivo {idx + 1}/{len(valid_files)}: {f.name}"
-        )
-        try:
-            aggregate_file(f, po_totals, seen_keys_agg)
-            files_ok_agg.append(f)
-        except Exception as e:
-            logger.exception(f"Falha ao agregar totais do arquivo {f.name}")
-            diagnostics.append({
-                'arquivo': f.name,
-                'etapa': 'Etapa 2 — Cálculo de totais por PO',
-                'tipo': 'erro',
-                'mensagem': friendly_open_error(e),
-            })
-        progress_bar.progress(0.05 + 0.45 * ((idx + 1) / len(valid_files)))
-    del seen_keys_agg
-    gc.collect()
+    cache_paths: Dict[str, str] = {}  # nome do arquivo -> caminho do cache
 
-    # --- Passada 2: gravar o arquivo final direto em disco -------------------
-    out_fd, out_path = tempfile.mkstemp(suffix='.xlsx', prefix='po_processado_')
-    os.close(out_fd)
-
-    wb_out = Workbook(write_only=True)
-    ws_out = wb_out.create_sheet('PO_Processado')
-    ws_out.append(final_header)
-
-    seen_keys_write: Set[Tuple[Optional[int], Optional[int]]] = set()
-    vendor_names_seen: Set[str] = set()
-    total_rows_written = 0
-    files_ok_write = 0
-    # Só tenta gravar arquivos que sobreviveram à etapa de agregação, para
-    # manter os totais por PO consistentes com as linhas gravadas.
-    for idx, f in enumerate(files_ok_agg):
-        status_placeholder.info(
-            f"💾 Etapa 3/3 — Gerando arquivo final... arquivo {idx + 1}/{len(files_ok_agg)}: {f.name}"
-        )
-        try:
-            total_rows_written += write_file_rows(
-                f, ws_out, final_header, po_totals, seen_keys_write, vendor_names_seen
+    try:
+        for idx, f in enumerate(valid_files):
+            status_placeholder.info(
+                f"➕ Etapa 2/3 — Lendo e calculando totais por PO... arquivo {idx + 1}/{len(valid_files)}: {f.name}"
             )
-            files_ok_write += 1
-        except Exception as e:
-            logger.exception(f"Falha ao gravar linhas do arquivo {f.name}")
-            diagnostics.append({
-                'arquivo': f.name,
-                'etapa': 'Etapa 3 — Gravação do arquivo final',
-                'tipo': 'erro',
-                'mensagem': friendly_open_error(e),
-            })
-        progress_bar.progress(0.5 + 0.45 * ((idx + 1) / max(len(files_ok_agg), 1)))
+            cache_fd, cache_path = tempfile.mkstemp(suffix='.cache', prefix='po_cache_')
+            os.close(cache_fd)
+            try:
+                aggregate_and_cache_file(f, po_totals, seen_keys_agg, cache_path)
+                files_ok_agg.append(f)
+                cache_paths[f.name] = cache_path
+            except Exception as e:
+                logger.exception(f"Falha ao agregar totais do arquivo {f.name}")
+                diagnostics.append({
+                    'arquivo': f.name,
+                    'etapa': 'Etapa 2 — Cálculo de totais por PO',
+                    'tipo': 'erro',
+                    'mensagem': friendly_open_error(e),
+                })
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+            progress_bar.progress(0.05 + 0.45 * ((idx + 1) / len(valid_files)))
+        del seen_keys_agg
 
-    wb_out.save(out_path)
-    progress_bar.progress(1.0)
+        # --- Passada 2: gravar o arquivo final direto em disco, a partir do cache
+        out_fd, out_path = tempfile.mkstemp(suffix='.xlsx', prefix='po_processado_')
+        os.close(out_fd)
+
+        wb_out = Workbook(write_only=True)
+        ws_out = wb_out.create_sheet('PO_Processado')
+        ws_out.append(final_header)
+
+        seen_keys_write: Set[Tuple[Optional[int], Optional[int]]] = set()
+        vendor_names_seen: Set[str] = set()
+        total_rows_written = 0
+        files_ok_write = 0
+        # Só tenta gravar arquivos que sobreviveram à etapa de agregação, para
+        # manter os totais por PO consistentes com as linhas gravadas.
+        for idx, f in enumerate(files_ok_agg):
+            status_placeholder.info(
+                f"💾 Etapa 3/3 — Gerando arquivo final... arquivo {idx + 1}/{len(files_ok_agg)}: {f.name}"
+            )
+            try:
+                total_rows_written += write_file_rows(
+                    cache_paths[f.name], ws_out, final_header, po_totals, seen_keys_write, vendor_names_seen
+                )
+                files_ok_write += 1
+            except Exception as e:
+                logger.exception(f"Falha ao gravar linhas do arquivo {f.name}")
+                diagnostics.append({
+                    'arquivo': f.name,
+                    'etapa': 'Etapa 3 — Gravação do arquivo final',
+                    'tipo': 'erro',
+                    'mensagem': friendly_open_error(e),
+                })
+            progress_bar.progress(0.5 + 0.45 * ((idx + 1) / max(len(files_ok_agg), 1)))
+
+        wb_out.save(out_path)
+        progress_bar.progress(1.0)
+    finally:
+        # Sempre limpar os arquivos de cache temporários, mesmo se algo falhar.
+        for cache_path in cache_paths.values():
+            if os.path.exists(cache_path):
+                try:
+                    os.remove(cache_path)
+                except Exception as e:
+                    logger.warning(f"Não foi possível remover cache temporário {cache_path}: {e}")
+        gc.collect()
 
     return {
         'output_path': out_path,
