@@ -21,24 +21,55 @@
 # =============================================================================
 #
 # =============================================================================
-# ARQUITETURA DESTE SCRIPT (memória baixa + isolamento de falhas por arquivo)
+# ARQUITETURA DESTE SCRIPT (v4.0 — dedup por "mais recente" + saída ordenada)
 # -----------------------------------------------------------------------------
-# Esta versão processa cada arquivo, um de cada vez, usando openpyxl em modo
-# "read_only" (leitura linha a linha) e grava o resultado direto em disco em
-# modo "write_only" (também linha a linha) — sem nunca carregar tudo na RAM.
+# REGRA DE DEDUPLICAÇÃO ('unique' nunca se repete):
+#   - A chave de um registro é (Purchasing Document, Item). Se essa MESMA
+#     chave aparecer em mais de um arquivo do lote (ou mais de uma vez no
+#     mesmo arquivo), apenas UM registro sobrevive no resultado final —
+#     nunca duas linhas com o mesmo valor de 'unique'.
+#   - O registro que sobrevive é escolhido comparando a coluna
+#     'Document Date' de cada ocorrência:
+#       1) Se as duas ocorrências tiverem 'Document Date', vence a mais
+#          recente (data maior).
+#       2) Se só uma das duas tiver 'Document Date', vence a que TEM data
+#          (considerada mais completa/confiável).
+#       3) Se nenhuma tiver 'Document Date', ou as duas datas forem iguais,
+#          vence a última processada (desempate estável pela ordem de
+#          leitura dos arquivos/linhas).
 #
-# Isolamento de falhas por arquivo:
-#   - Cada etapa (mapear colunas / agregar totais / gravar linhas) roda por
-#     arquivo dentro de um try/except próprio.
-#   - Se um arquivo falhar, ele é marcado como "com erro", pulado, e o
-#     processamento CONTINUA normalmente para os demais arquivos do lote.
-#     NENHUM arquivo com problema interrompe o lote inteiro.
-#   - Todos os erros (arquivo, etapa, mensagem, traceback) são guardados em
-#     st.session_state.file_diagnostics e exibidos na aba "🛠️ Diagnóstico",
-#     junto com avisos de colunas obrigatórias ausentes por arquivo.
+# ORDENAÇÃO FINAL:
+#   - As linhas do arquivo de saída são sempre gravadas em ordem CRESCENTE
+#     de 'unique' (Purchasing Document e, dentro dele, Item) — ou seja, a
+#     planilha final sai ordenada do menor para o maior 'unique'.
+#
+# POR QUE A ARQUITETURA MUDOU EM RELAÇÃO À VERSÃO ANTERIOR (cache em disco):
+#   - A versão anterior conseguia gravar o arquivo final em streaming (linha
+#     a linha, sem guardar nada em memória) porque bastava manter a PRIMEIRA
+#     ocorrência de cada chave.
+#   - Agora, para decidir qual ocorrência é "mais recente", é necessário
+#     comparar todas as ocorrências da MESMA chave antes de decidir qual
+#     gravar — e para ordenar o resultado por 'unique' também é necessário
+#     ter todas as linhas escolhidas em mãos antes de começar a escrever.
+#   - Por isso, este script mantém em memória apenas UM registro por chave
+#     (Purchasing Document + Item) — nunca as linhas duplicadas descartadas
+#     — com os valores já convertidos (não o Excel bruto). Isso é bem mais
+#     leve do que manter todas as linhas de todos os arquivos, mas ainda
+#     assim é maior que zero, então o consumo de memória cresce com o
+#     número de combinações ÚNICAS de Purchasing Document + Item no lote
+#     (não com o número total de linhas lidas).
+#
+# ISOLAMENTO DE FALHAS POR ARQUIVO (mantido):
+#   - Cada arquivo é lido dentro de um try/except próprio. Se um arquivo
+#     falhar (corrompido, protegido por senha, sem cabeçalho legível etc.),
+#     ele é marcado como "com erro", pulado, e o processamento CONTINUA
+#     normalmente para os demais arquivos do lote. Nenhum arquivo com
+#     problema interrompe o lote inteiro.
+#   - Todos os erros/avisos ficam em st.session_state.file_diagnostics e são
+#     exibidos na aba "🛠️ Diagnóstico".
 #
 # =============================================================================
-# ORDEM FIXA DE COLUNAS (v3.0) — baseada no arquivo EXEMPLO fornecido
+# ORDEM FIXA DE COLUNAS (baseada no arquivo EXEMPLO fornecido)
 # -----------------------------------------------------------------------------
 #   - FINAL_COLUMN_ORDER abaixo é a ordem EXATA de colunas do arquivo de
 #     exemplo (EXEMPLO.xlsx), na mesma sequência em que elas aparecem lá,
@@ -48,7 +79,8 @@
 #   - O arquivo final SEMPRE sai com essas colunas, nessa ordem, mesmo que
 #     um arquivo de entrada específico não tenha alguma delas (nesse caso a
 #     célula fica em branco só para as linhas daquele arquivo).
-#   - 'unique' é sempre a ÚLTIMA coluna dentro de FINAL_COLUMN_ORDER.
+#   - 'unique' é sempre a ÚLTIMA coluna dentro de FINAL_COLUMN_ORDER, e cada
+#     valor de 'unique' aparece no máximo UMA vez no arquivo final.
 #   - Se algum arquivo do lote tiver uma coluna com nome que NÃO está em
 #     FINAL_COLUMN_ORDER (coluna nova/desconhecida), ela é preservada e
 #     posicionada DEPOIS de 'unique' (ou seja, no final de tudo) — nunca
@@ -56,8 +88,6 @@
 #   - Nenhuma coluna do arquivo é descartada: as conhecidas seguem a ordem
 #     fixa, as desconhecidas vão para o final, na ordem em que forem
 #     encontradas nos arquivos do lote.
-#   - Nenhum problema em um arquivo específico (coluna faltando, coluna
-#     extra, erro ao abrir etc.) interrompe o processamento dos demais.
 # =============================================================================
 
 import streamlit as st
@@ -68,9 +98,6 @@ import os
 import gc
 import re
 import traceback
-import tempfile
-import zipfile
-import pickle
 import logging
 from typing import List, Optional, Any, Dict, Set, Tuple
 
@@ -118,12 +145,12 @@ ID_COLUMNS = ['Purchasing Document', 'Item', 'Material']
 # título/logo (comum em relatórios exportados do SAP GUI).
 HEADER_SCAN_MAX_ROWS = 20
 
+# Coluna usada para decidir qual ocorrência de uma chave duplicada é a
+# "mais recente" (ver regra de deduplicação no topo do arquivo).
+RECENCY_COLUMN = 'Document Date'
+
 # =============================================================================
 # ORDEM FIXA E DEFINITIVA DAS COLUNAS NO ARQUIVO FINAL
-# -----------------------------------------------------------------------------
-# Extraída diretamente do cabeçalho do arquivo EXEMPLO.xlsx fornecido, na
-# mesma ordem, com duplicatas de nome removidas (mantendo a primeira
-# ocorrência). 'unique' é sempre a última coluna desta lista.
 # =============================================================================
 FINAL_COLUMN_ORDER: List[str] = [
     'Purchasing Document',
@@ -390,6 +417,7 @@ def get_cell(row: Tuple[Any, ...], col_idx: Dict[str, int], name: str, default: 
 
 def friendly_open_error(e: Exception) -> str:
     """Traduz as exceções mais comuns do openpyxl/zipfile em mensagens úteis."""
+    import zipfile
     if isinstance(e, zipfile.BadZipFile):
         return (
             "O arquivo não é um .xlsx válido (zip corrompido). Isso costuma acontecer "
@@ -556,6 +584,19 @@ def build_master_columns(
                 ),
             })
 
+        if RECENCY_COLUMN not in header:
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 1 — Mapeamento de colunas',
+                'tipo': 'aviso',
+                'mensagem': (
+                    f"Coluna '{RECENCY_COLUMN}' ausente neste arquivo. Ela é usada para "
+                    "decidir qual registro prevalece quando o mesmo Purchasing Document + "
+                    "Item aparece em mais de um arquivo do lote. Sem ela, linhas deste "
+                    "arquivo só vencem um empate se forem as últimas processadas."
+                ),
+            })
+
         valid_files.append(f)
         # Deduplica nomes repetidos dentro do PRÓPRIO cabeçalho do arquivo
         # (mesma política de build_col_index: mantém a primeira ocorrência).
@@ -588,211 +629,205 @@ def build_final_header(master_columns: List[str]) -> Tuple[List[str], List[str]]
 
 
 # =============================================================================
-# PASSADA 1 — agregar totais por PO E gravar um cache local, em UMA só leitura
-# -----------------------------------------------------------------------------
-# A parte mais cara de todo o pipeline é abrir e converter o .xlsx original
-# em objetos Python (o openpyxl precisa descompactar o zip e parsear o XML
-# de cada linha). Fazer isso em UMA única leitura por arquivo (em vez de
-# duas): enquanto calculamos os totais, já vamos gravando cada linha (via
-# pickle, streaming, sem acumular nada em memória) em um arquivo de cache
-# local em disco. A etapa seguinte (write_file_rows / open_cached_rows) relê
-# esse cache — muito mais rápido que reabrir o .xlsx original.
+# PASSADA 1 — ler cada arquivo UMA vez e manter, por chave (Purchasing
+# Document + Item), apenas o registro "vencedor" (mais recente)
 # =============================================================================
 
-def aggregate_and_cache_file(uploaded_file: Any, po_totals: Dict[int, Dict[str, float]],
-                              seen_keys: Set[Tuple[Optional[int], Optional[int]]],
-                              cache_path: str) -> int:
+def is_better_candidate(candidate_date: Optional[datetime], current_date: Optional[datetime]) -> bool:
     """
-    Lê o arquivo original UMA vez: acumula os totais por PO em `po_totals`
-    e, ao mesmo tempo, grava o cabeçalho + cada linha bruta em `cache_path`
-    (formato pickle, uma leitura/gravação em streaming, custo de memória
-    desprezível). `seen_keys` evita contar a mesma linha (mesmo PO+Item)
-    duas vezes. Retorna o número de linhas válidas processadas (métricas).
-    Pode lançar exceção — o chamador (process_files) isola a falha por arquivo.
+    Decide se um novo registro (candidate) deve substituir o registro atual
+    (current) como vencedor de uma chave (Purchasing Document + Item), com
+    base na coluna 'Document Date' de cada um.
+
+    Regras (nessa ordem):
+      1) As duas têm data -> vence a mais recente (data maior ou igual, o
+         que faz o último processado vencer em caso de empate exato).
+      2) Só o candidato tem data -> o candidato vence (mais completo).
+      3) Só o atual tem data -> o atual permanece.
+      4) Nenhum dos dois tem data -> o candidato vence (desempate estável
+         pela ordem de processamento: o último lido vence).
+    """
+    if candidate_date is not None and current_date is not None:
+        return candidate_date >= current_date
+    if candidate_date is not None and current_date is None:
+        return True
+    if candidate_date is None and current_date is not None:
+        return False
+    return True  # nenhum dos dois tem data -> último processado vence
+
+
+def extract_row_record(row: Tuple[Any, ...], col_idx: Dict[str, int],
+                        file_columns: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Transforma UMA linha bruta do Excel em um "registro" com todos os
+    valores já convertidos (datas formatadas, números limpos, IDs
+    normalizados) e os campos auxiliares necessários para agregação e
+    escrita final. Retorna None se a linha não tiver um Purchasing Document
+    válido (mesmo filtro da versão anterior: descarta linhas de rodapé/total
+    onde o Purchasing Document veio como texto).
+    """
+    raw_po = get_cell(row, col_idx, 'Purchasing Document')
+    if isinstance(raw_po, str):
+        return None
+    po_id = parse_id(raw_po)
+    if po_id is None:
+        return None
+
+    item_id = parse_id(get_cell(row, col_idx, 'Item'))
+    material_id = parse_id(get_cell(row, col_idx, 'Material'))
+
+    qty = to_number(get_cell(row, col_idx, 'Order Quantity', 0))
+    net_value = to_number(get_cell(row, col_idx, 'Net order value', 0))
+    pbxx = to_number(get_cell(row, col_idx, 'PBXX Condition Amount', 0))
+    valor_unitario = safe_division(net_value, qty)
+    valor_item_com_impostos = pbxx * qty
+
+    doc_date = parse_date_value(get_cell(row, col_idx, RECENCY_COLUMN))
+
+    wbs_raw = get_cell(row, col_idx, 'Andritz WBS Element')
+    codigo_projeto_str = extract_code(wbs_raw) if isinstance(wbs_raw, str) else ''
+    codigo_projeto = int(codigo_projeto_str) if codigo_projeto_str else ''
+
+    vendor_name_raw = get_cell(row, col_idx, 'Vendor Name')
+    vendor_name = str(vendor_name_raw) if vendor_name_raw else None
+
+    # Monta os valores de TODAS as colunas de origem deste arquivo, já
+    # convertidos. Colunas calculadas nunca vêm do arquivo, então são
+    # excluídas de `file_columns` por quem chama esta função.
+    out_partial: Dict[str, Any] = {}
+    for col in file_columns:
+        val = get_cell(row, col_idx, col)
+        if col in DATE_COLUMNS:
+            dt = parse_date_value(val)
+            val = dt.strftime('%d/%m/%Y') if dt else ''
+        elif col in NUMERIC_SOURCE_COLUMNS:
+            val = to_number(val)
+        elif col == 'Purchasing Document':
+            val = po_id
+        elif col == 'Item':
+            val = item_id
+        elif col == 'Material':
+            val = material_id
+        # IMPORTANTE: nunca deixar None aqui, senão a linha final fica
+        # desalinhada em relação ao cabeçalho.
+        if val is None:
+            val = ''
+        out_partial[col] = val
+
+    return {
+        'po_id': po_id,
+        'item_id': item_id,
+        'qty': qty,
+        'net_value': net_value,
+        'valor_unitario': valor_unitario,
+        'valor_item_com_impostos': valor_item_com_impostos,
+        'doc_date': doc_date,
+        'codigo_projeto': codigo_projeto,
+        'vendor_name': vendor_name,
+        'out_partial': out_partial,
+    }
+
+
+def process_file_into_winners(uploaded_file: Any,
+                               winners: Dict[Tuple[int, Optional[int]], Dict[str, Any]]) -> int:
+    """
+    Lê o arquivo original UMA única vez, linha a linha (streaming, sem
+    carregar o arquivo inteiro em memória). Para cada linha válida, decide
+    se ela deve entrar/substituir o registro vencedor de sua chave
+    (Purchasing Document + Item) dentro de `winners`, usando a regra de
+    'mais recente' (ver is_better_candidate). Retorna o número de linhas
+    válidas lidas (métrica). Pode lançar exceção — o chamador
+    (process_files) isola a falha por arquivo.
     """
     uploaded_file.seek(0)
     wb = load_workbook(uploaded_file, read_only=True, data_only=True)
-    processed = 0
+    read_count = 0
     try:
         ws = wb.worksheets[0]
         header, rows_iter, header_idx = locate_header_and_rows(ws)
-        with open(cache_path, 'wb') as cache_f:
-            pickle.dump(header, cache_f, protocol=pickle.HIGHEST_PROTOCOL)
+        if header_idx == -1:
+            return 0
+        col_idx = build_col_index(header)
+        file_columns = [c for c in header if c and c not in COMPUTED_COLUMN_NAMES]
 
-            if header_idx == -1:
-                return 0
-            col_idx = build_col_index(header)
-
-            for row in rows_iter:
-                pickle.dump(row, cache_f, protocol=pickle.HIGHEST_PROTOCOL)
-
-                raw_po = get_cell(row, col_idx, 'Purchasing Document')
-                # Replica o filtro original: descarta a linha se o Purchasing
-                # Document veio como texto (ex: linhas de rodapé/total).
-                if isinstance(raw_po, str):
-                    continue
-                po_id = parse_id(raw_po)
-                if po_id is None:
-                    continue
-
-                item_id = parse_id(get_cell(row, col_idx, 'Item'))
-                key = (po_id, item_id)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-
-                qty = to_number(get_cell(row, col_idx, 'Order Quantity', 0))
-                net_value = to_number(get_cell(row, col_idx, 'Net order value', 0))
-                pbxx = to_number(get_cell(row, col_idx, 'PBXX Condition Amount', 0))
-                valor_item_com_impostos = pbxx * qty
-
-                entry = po_totals.setdefault(po_id, {'net': 0.0, 'com_impostos': 0.0, 'qty': 0.0})
-                entry['net'] += net_value
-                entry['com_impostos'] += valor_item_com_impostos
-                entry['qty'] += qty
-                processed += 1
+        for row in rows_iter:
+            record = extract_row_record(row, col_idx, file_columns)
+            if record is None:
+                continue
+            key = (record['po_id'], record['item_id'])
+            current = winners.get(key)
+            if current is None or is_better_candidate(record['doc_date'], current['doc_date']):
+                winners[key] = record
+            read_count += 1
     finally:
         wb.close()
         uploaded_file.seek(0)
-    return processed
-
-
-def open_cached_rows(cache_path: str) -> Tuple[List[str], Any]:
-    """Abre o cache pickle gravado por aggregate_and_cache_file e retorna
-    (header, gerador_de_linhas), lendo uma linha por vez (sem carregar tudo
-    na memória). O arquivo de cache é fechado automaticamente quando o
-    gerador é totalmente consumido."""
-    cache_f = open(cache_path, 'rb')
-    try:
-        header = pickle.load(cache_f)
-    except EOFError:
-        cache_f.close()
-        return [], iter(())
-
-    def _rows():
-        try:
-            while True:
-                try:
-                    yield pickle.load(cache_f)
-                except EOFError:
-                    return
-        finally:
-            cache_f.close()
-
-    return header, _rows()
+    return read_count
 
 
 # =============================================================================
-# PASSADA 2 — gravar o arquivo final, linha a linha, direto em disco
+# PASSADA 2 — agregar totais por PO (a partir só dos vencedores) e gravar o
+# arquivo final, já ORDENADO por 'unique' crescente
 # =============================================================================
 
-def write_file_rows(cache_path: str, ws_out: Any, final_header: List[str],
-                     po_totals: Dict[int, Dict[str, float]],
-                     seen_keys: Set[Tuple[Optional[int], Optional[int]]],
-                     vendor_names_seen: Set[str]) -> int:
-    """
-    Relê o cache local (gravado por aggregate_and_cache_file) linha a linha,
-    calcula as colunas derivadas e grava cada linha diretamente na planilha
-    de saída (write_only), sem acumular o resultado em memória. Retorna o
-    número de linhas gravadas.
+def build_po_totals(winners: Dict[Tuple[int, Optional[int]], Dict[str, Any]]) -> Dict[int, Dict[str, float]]:
+    """Agrega net/com_impostos/qty por Purchasing Document, considerando
+    apenas os registros vencedores (nunca conta uma linha duas vezes, pois
+    duplicatas já foram eliminadas antes desta etapa)."""
+    po_totals: Dict[int, Dict[str, float]] = {}
+    for record in winners.values():
+        entry = po_totals.setdefault(record['po_id'], {'net': 0.0, 'com_impostos': 0.0, 'qty': 0.0})
+        entry['net'] += record['net_value']
+        entry['com_impostos'] += record['valor_item_com_impostos']
+        entry['qty'] += record['qty']
+    return po_totals
 
-    A linha gravada segue exatamente `final_header`: qualquer coluna que
-    não exista neste arquivo específico sai em branco para essas linhas —
-    nunca desalinha ou encurta a linha.
 
-    Pode lançar exceção — o chamador (process_files) é responsável por
-    isolar a falha por arquivo.
+def write_sorted_output(ws_out: Any, final_header: List[str],
+                         winners: Dict[Tuple[int, Optional[int]], Dict[str, Any]],
+                         po_totals: Dict[int, Dict[str, float]]) -> Tuple[int, Set[str]]:
     """
+    Grava uma linha por chave vencedora, em ordem CRESCENTE de
+    (Purchasing Document, Item) — o que corresponde à ordem crescente da
+    própria coluna 'unique'. Retorna (linhas_gravadas, nomes_de_fornecedor_vistos).
+    """
+    vendor_names_seen: Set[str] = set()
     written = 0
-    header, rows_iter = open_cached_rows(cache_path)
-    if not header:
-        return 0
-    col_idx = build_col_index(header)
 
-    # Só processamos colunas que este arquivo de fato possui — mas a
-    # linha final sempre é montada respeitando `final_header` por
-    # completo (colunas ausentes ficam em branco via out_row.get). Nomes
-    # de colunas calculadas nunca vêm do arquivo de origem, então são
-    # excluídos aqui para não conflitar com os valores derivados abaixo.
-    file_columns = [c for c in header if c and c not in COMPUTED_COLUMN_NAMES]
+    sorted_keys = sorted(
+        winners.keys(),
+        key=lambda k: (k[0], k[1] if k[1] is not None else -1)
+    )
 
-    try:
-        for row in rows_iter:
-            raw_po = get_cell(row, col_idx, 'Purchasing Document')
-            if isinstance(raw_po, str):
-                continue
-            po_id = parse_id(raw_po)
-            if po_id is None:
-                continue
+    for key in sorted_keys:
+        record = winners[key]
+        po_id = record['po_id']
+        item_id = record['item_id']
+        totals = po_totals.get(po_id, {'net': 0.0, 'com_impostos': 0.0, 'qty': 0.0})
 
-            item_id = parse_id(get_cell(row, col_idx, 'Item'))
-            key = (po_id, item_id)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
+        if record['vendor_name']:
+            vendor_names_seen.add(record['vendor_name'])
 
-            material_id = parse_id(get_cell(row, col_idx, 'Material'))
+        out_row: Dict[str, Any] = dict(record['out_partial'])
+        out_row['total_itens_po'] = totals['qty']
+        out_row['valor_unitario'] = record['valor_unitario']
+        out_row['valor_item_com_impostos'] = record['valor_item_com_impostos']
+        out_row['total_valor_po_liquido'] = totals['net']
+        out_row['total_valor_po_com_impostos'] = totals['com_impostos']
+        out_row['valor_unitario_formatted'] = format_currency(record['valor_unitario'])
+        out_row['valor_item_com_impostos_formatted'] = format_currency(record['valor_item_com_impostos'])
+        out_row['Net order value_formatted'] = format_currency(record['net_value'])
+        out_row['total_valor_po_liquido_formatted'] = format_currency(totals['net'])
+        out_row['total_valor_po_com_impostos_formatted'] = format_currency(totals['com_impostos'])
+        out_row['PO Creation Date'] = record['doc_date'].strftime('%d/%m/%Y') if record['doc_date'] else ''
+        out_row['codigo_projeto'] = record['codigo_projeto']
+        # 'unique' nunca se repete: é exatamente a chave de deduplicação.
+        out_row['unique'] = f"{po_id}{item_id if item_id is not None else ''}"
 
-            qty = to_number(get_cell(row, col_idx, 'Order Quantity', 0))
-            net_value = to_number(get_cell(row, col_idx, 'Net order value', 0))
-            pbxx = to_number(get_cell(row, col_idx, 'PBXX Condition Amount', 0))
-            valor_unitario = safe_division(net_value, qty)
-            valor_item_com_impostos = pbxx * qty
+        ws_out.append([out_row.get(col, '') for col in final_header])
+        written += 1
 
-            totals = po_totals.get(po_id, {'net': 0.0, 'com_impostos': 0.0, 'qty': 0.0})
-
-            doc_date = parse_date_value(get_cell(row, col_idx, 'Document Date'))
-            wbs_raw = get_cell(row, col_idx, 'Andritz WBS Element')
-            codigo_projeto_str = extract_code(wbs_raw) if isinstance(wbs_raw, str) else ''
-            codigo_projeto = int(codigo_projeto_str) if codigo_projeto_str else ''
-
-            vendor_name = get_cell(row, col_idx, 'Vendor Name')
-            if vendor_name:
-                vendor_names_seen.add(str(vendor_name))
-
-            # Monta a linha de saída com TODAS as colunas deste arquivo
-            # (origem) + calculadas. Colunas de FINAL_COLUMN_ORDER que este
-            # arquivo não tem simplesmente não entram aqui, e por isso saem
-            # em branco na hora do append final (out_row.get(col, '')).
-            out_row: Dict[str, Any] = {}
-            for col in file_columns:
-                val = get_cell(row, col_idx, col)
-                if col in DATE_COLUMNS:
-                    dt = parse_date_value(val)
-                    val = dt.strftime('%d/%m/%Y') if dt else ''
-                elif col in NUMERIC_SOURCE_COLUMNS:
-                    val = to_number(val)
-                elif col == 'Purchasing Document':
-                    val = po_id
-                elif col == 'Item':
-                    val = item_id
-                elif col == 'Material':
-                    val = material_id
-                # IMPORTANTE: nunca deixar None aqui, senão a linha gravada
-                # fica mais curta/desalinhada em relação ao cabeçalho final.
-                if val is None:
-                    val = ''
-                out_row[col] = val
-
-            out_row['total_itens_po'] = totals['qty']
-            out_row['valor_unitario'] = valor_unitario
-            out_row['valor_item_com_impostos'] = valor_item_com_impostos
-            out_row['total_valor_po_liquido'] = totals['net']
-            out_row['total_valor_po_com_impostos'] = totals['com_impostos']
-            out_row['valor_unitario_formatted'] = format_currency(valor_unitario)
-            out_row['valor_item_com_impostos_formatted'] = format_currency(valor_item_com_impostos)
-            out_row['Net order value_formatted'] = format_currency(net_value)
-            out_row['total_valor_po_liquido_formatted'] = format_currency(totals['net'])
-            out_row['total_valor_po_com_impostos_formatted'] = format_currency(totals['com_impostos'])
-            out_row['PO Creation Date'] = doc_date.strftime('%d/%m/%Y') if doc_date else ''
-            out_row['codigo_projeto'] = codigo_projeto
-            out_row['unique'] = f"{po_id}{item_id if item_id is not None else ''}"
-
-            ws_out.append([out_row.get(col, '') for col in final_header])
-            written += 1
-    finally:
-        rows_iter.close()
-    return written
+    return written, vendor_names_seen
 
 
 # =============================================================================
@@ -812,8 +847,6 @@ def read_preview_rows(path: str, n: int = PREVIEW_ROWS) -> pd.DataFrame:
         for i, row in enumerate(rows_iter):
             if i >= n:
                 break
-            # Defensa extra: nunca deixar uma linha mais curta/longa que o
-            # cabeçalho quebrar o preview — completa com '' ou corta o excesso.
             row = list(row)
             if len(row) < n_cols:
                 row = row + [''] * (n_cols - len(row))
@@ -826,23 +859,24 @@ def read_preview_rows(path: str, n: int = PREVIEW_ROWS) -> pd.DataFrame:
 
 
 # =============================================================================
-# Orquestração do pipeline completo (as 3 passadas, com isolamento de falhas)
+# Orquestração do pipeline completo (com isolamento de falhas por arquivo)
 # =============================================================================
 
 def process_files(uploaded_files: List[Any], progress_bar: Any, status_placeholder: Any) -> Dict[str, Any]:
     """
-    Executa as 3 passadas sobre a lista de arquivos e grava o resultado em um
-    arquivo temporário em disco. Retorna um dicionário com o caminho do
-    arquivo final, as métricas calculadas e a lista de diagnósticos
-    (erros/avisos por arquivo) encontrados ao longo do processamento.
+    Executa o pipeline completo sobre a lista de arquivos e grava o
+    resultado em um arquivo temporário em disco. Retorna um dicionário com o
+    caminho do arquivo final, as métricas calculadas e a lista de
+    diagnósticos (erros/avisos por arquivo) encontrados ao longo do
+    processamento.
 
-    Nenhum arquivo com problema interrompe o lote: cada etapa isola a falha
-    e segue para o próximo arquivo.
+    Nenhum arquivo com problema interrompe o lote: a leitura de cada arquivo
+    é isolada; se uma falhar, o processamento segue para o próximo.
     """
     diagnostics: List[Dict[str, str]] = []
     n_files = len(uploaded_files)
 
-    # --- Passada 0: mapear colunas -----------------------------------------
+    # --- Etapa 1: mapear colunas --------------------------------------------
     status_placeholder.info("🔎 Etapa 1/3 — Mapeando colunas dos arquivos...")
     master_columns, valid_files = build_master_columns(uploaded_files, diagnostics)
     final_header, extra_columns = build_final_header(master_columns)
@@ -873,39 +907,45 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
             'files_total': n_files,
         }
 
-    # --- Passada 1: agregar totais por PO + gravar cache local em disco ------
-    # (leitura ÚNICA do .xlsx original de cada arquivo — ver comentário em
-    # aggregate_and_cache_file sobre por que isso é bem mais rápido)
-    po_totals: Dict[int, Dict[str, float]] = {}
-    seen_keys_agg: Set[Tuple[Optional[int], Optional[int]]] = set()
-    files_ok_agg: List[Any] = []
-    cache_paths: Dict[str, str] = {}  # nome do arquivo -> caminho do cache
+    # --- Etapa 2: ler cada arquivo uma vez e escolher o registro vencedor ---
+    # por chave (Purchasing Document + Item), com base na coluna
+    # 'Document Date' (ver is_better_candidate). Só o registro vencedor de
+    # cada chave fica em memória — nunca as ocorrências duplicadas descartadas.
+    winners: Dict[Tuple[int, Optional[int]], Dict[str, Any]] = {}
+    files_ok_read: List[Any] = []
+
+    for idx, f in enumerate(valid_files):
+        status_placeholder.info(
+            f"➕ Etapa 2/3 — Lendo arquivos e selecionando o registro mais recente de cada "
+            f"Purchasing Document + Item... arquivo {idx + 1}/{len(valid_files)}: {f.name}"
+        )
+        try:
+            process_file_into_winners(f, winners)
+            files_ok_read.append(f)
+        except Exception as e:
+            logger.exception(f"Falha ao ler o arquivo {f.name}")
+            diagnostics.append({
+                'arquivo': f.name,
+                'etapa': 'Etapa 2 — Leitura e seleção do registro mais recente',
+                'tipo': 'erro',
+                'mensagem': friendly_open_error(e),
+            })
+        progress_bar.progress(0.05 + 0.55 * ((idx + 1) / len(valid_files)))
+
+    # --- Etapa 3: agregar totais por PO (só com os vencedores) e gravar -----
+    # o arquivo final já ORDENADO por 'unique' crescente.
+    status_placeholder.info("💾 Etapa 3/3 — Agregando totais por PO e gravando o arquivo final ordenado...")
+
+    total_rows_written = 0
+    total_pos = 0
+    vendor_names_seen: Set[str] = set()
+    out_path: Optional[str] = None
 
     try:
-        for idx, f in enumerate(valid_files):
-            status_placeholder.info(
-                f"➕ Etapa 2/3 — Lendo e calculando totais por PO... arquivo {idx + 1}/{len(valid_files)}: {f.name}"
-            )
-            cache_fd, cache_path = tempfile.mkstemp(suffix='.cache', prefix='po_cache_')
-            os.close(cache_fd)
-            try:
-                aggregate_and_cache_file(f, po_totals, seen_keys_agg, cache_path)
-                files_ok_agg.append(f)
-                cache_paths[f.name] = cache_path
-            except Exception as e:
-                logger.exception(f"Falha ao agregar totais do arquivo {f.name}")
-                diagnostics.append({
-                    'arquivo': f.name,
-                    'etapa': 'Etapa 2 — Cálculo de totais por PO',
-                    'tipo': 'erro',
-                    'mensagem': friendly_open_error(e),
-                })
-                if os.path.exists(cache_path):
-                    os.remove(cache_path)
-            progress_bar.progress(0.05 + 0.45 * ((idx + 1) / len(valid_files)))
-        del seen_keys_agg
+        po_totals = build_po_totals(winners)
+        total_pos = len(po_totals)
 
-        # --- Passada 2: gravar o arquivo final direto em disco, a partir do cache
+        import tempfile
         out_fd, out_path = tempfile.mkstemp(suffix='.xlsx', prefix='po_processado_')
         os.close(out_fd)
 
@@ -913,51 +953,36 @@ def process_files(uploaded_files: List[Any], progress_bar: Any, status_placehold
         ws_out = wb_out.create_sheet('PO_Processado')
         ws_out.append(final_header)
 
-        seen_keys_write: Set[Tuple[Optional[int], Optional[int]]] = set()
-        vendor_names_seen: Set[str] = set()
-        total_rows_written = 0
-        files_ok_write = 0
-        # Só tenta gravar arquivos que sobreviveram à etapa de agregação, para
-        # manter os totais por PO consistentes com as linhas gravadas.
-        for idx, f in enumerate(files_ok_agg):
-            status_placeholder.info(
-                f"💾 Etapa 3/3 — Gerando arquivo final... arquivo {idx + 1}/{len(files_ok_agg)}: {f.name}"
-            )
-            try:
-                total_rows_written += write_file_rows(
-                    cache_paths[f.name], ws_out, final_header, po_totals, seen_keys_write, vendor_names_seen
-                )
-                files_ok_write += 1
-            except Exception as e:
-                logger.exception(f"Falha ao gravar linhas do arquivo {f.name}")
-                diagnostics.append({
-                    'arquivo': f.name,
-                    'etapa': 'Etapa 3 — Gravação do arquivo final',
-                    'tipo': 'erro',
-                    'mensagem': friendly_open_error(e),
-                })
-            progress_bar.progress(0.5 + 0.45 * ((idx + 1) / max(len(files_ok_agg), 1)))
+        total_rows_written, vendor_names_seen = write_sorted_output(ws_out, final_header, winners, po_totals)
 
         wb_out.save(out_path)
-        progress_bar.progress(1.0)
-    finally:
-        # Sempre limpar os arquivos de cache temporários, mesmo se algo falhar.
-        for cache_path in cache_paths.values():
-            if os.path.exists(cache_path):
-                try:
-                    os.remove(cache_path)
-                except Exception as e:
-                    logger.warning(f"Não foi possível remover cache temporário {cache_path}: {e}")
-        gc.collect()
+    except Exception as e:
+        logger.exception("Falha ao agregar totais / gravar o arquivo final")
+        diagnostics.append({
+            'arquivo': '(vários arquivos)',
+            'etapa': 'Etapa 3 — Agregação e gravação do arquivo final',
+            'tipo': 'erro',
+            'mensagem': friendly_open_error(e),
+        })
+        if out_path and os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+        out_path = None
+        total_rows_written = 0
+
+    progress_bar.progress(1.0)
+    gc.collect()
 
     return {
         'output_path': out_path,
         'total_rows': total_rows_written,
-        'total_pos': len(po_totals),
+        'total_pos': total_pos,
         'total_vendors': len(vendor_names_seen),
         'total_columns': len(final_header),
         'diagnostics': diagnostics,
-        'files_ok': files_ok_write,
+        'files_ok': len(files_ok_read),
         'files_total': n_files,
     }
 
@@ -1009,12 +1034,13 @@ def main():
 
     st.header("📑 Sistema de Processamento de Pedidos de Compra")
     st.caption(
-        "Processamento em lote: cada arquivo é lido e liberado da memória um de "
-        "cada vez, e o resultado é gravado em disco linha a linha — sem manter "
-        "todos os dados na RAM de uma vez. O arquivo final segue sempre a mesma "
-        "ordem fixa de colunas (baseada no arquivo de exemplo); colunas ausentes "
-        "em algum arquivo saem em branco, e colunas extras/desconhecidas aparecem "
-        "depois de 'unique', no final do arquivo. Se um arquivo específico tiver "
+        "Processamento em lote: cada arquivo é lido uma única vez. Quando o mesmo "
+        "Purchasing Document + Item aparece em mais de um arquivo, só o registro com a "
+        "'Document Date' mais recente é mantido — a coluna 'unique' nunca se repete no "
+        "resultado final. O arquivo final sai sempre ordenado do menor para o maior "
+        "'unique' e segue a mesma ordem fixa de colunas (baseada no arquivo de exemplo); "
+        "colunas ausentes em algum arquivo saem em branco, e colunas extras/desconhecidas "
+        "aparecem depois de 'unique', no final do arquivo. Se um arquivo específico tiver "
         "problema, ele é isolado e reportado, sem derrubar o processamento dos demais."
     )
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -1092,11 +1118,9 @@ def main():
                             m1, m2, m3, m4 = st.columns(4)
                             m1.metric("Tempo de processamento", f"{elapsed_time:.2f}s")
                             m2.metric("Arquivos incluídos", f"{result['files_ok']}/{result['files_total']}")
-                            m3.metric("Registros processados", result['total_rows'])
+                            m3.metric("Registros únicos (unique)", result['total_rows'])
                             m4.metric("PO's distintas", result['total_pos'])
                     except Exception as e:
-                        # Falha realmente inesperada (fora do isolamento por arquivo).
-                        # Agora mostramos o motivo de verdade, em vez de esconder.
                         logger.error(f"Falha inesperada no processamento: {str(e)}")
                         st.session_state.last_exception = traceback.format_exc()
                         st.error(
@@ -1131,14 +1155,15 @@ def main():
             st.header("Visualização de Dados")
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric(label="Total de Linhas", value=metrics['total_rows'])
+            c1.metric(label="Total de Linhas (unique)", value=metrics['total_rows'])
             c2.metric(label="Número de Fornecedores", value=metrics['total_vendors'])
             c3.metric(label="Número de PO'S", value=metrics['total_pos'])
             c4.metric(label="Total de Colunas", value=metrics['total_columns'])
 
             st.caption(
-                f"Mostrando as primeiras {min(PREVIEW_ROWS, len(preview_df))} linhas do arquivo final "
-                "(apenas para conferência — o arquivo baixado contém todos os registros)."
+                f"Mostrando as primeiras {min(PREVIEW_ROWS, len(preview_df))} linhas do arquivo final, "
+                "já ordenado por 'unique' crescente (apenas para conferência — o arquivo baixado "
+                "contém todos os registros, todos com 'unique' distinto)."
             )
             st.dataframe(preview_df, hide_index=True)
         else:
@@ -1187,36 +1212,44 @@ def main():
            - Selecione um ou mais arquivos Excel (.xlsx)
            - O sistema aceita arquivos até {MAX_UPLOAD_SIZE_MB}MB no total (requer config.toml ajustado)
 
-        2. **Processamento (em 3 etapas, por arquivo)**
+        2. **Processamento (em 3 etapas)**
            - Etapa 1: mapeia todas as colunas presentes nos arquivos e valida colunas obrigatórias
-           - Etapa 2: calcula os totais por Pedido de Compra (PO)
-           - Etapa 3: grava o arquivo final direto em disco, linha a linha
-           - Cada arquivo é aberto, processado e liberado da memória antes do próximo
-           - Se UM arquivo falhar em qualquer etapa, ele é isolado e reportado na aba
+           - Etapa 2: lê cada arquivo uma vez e, para cada Purchasing Document + Item, mantém
+             apenas o registro com a 'Document Date' mais recente (se o mesmo PO + Item
+             aparecer em mais de um arquivo, o mais antigo é descartado)
+           - Etapa 3: agrega os totais por Pedido de Compra (considerando só os registros
+             mantidos) e grava o arquivo final, já ORDENADO por 'unique' crescente
+           - Se UM arquivo falhar na leitura, ele é isolado e reportado na aba
              "🛠️ Diagnóstico" — os demais arquivos do lote continuam sendo processados
              normalmente, sem nenhuma interrupção do lote inteiro
 
-        3. **Ordem das colunas no arquivo final (FIXA, baseada no arquivo de exemplo)**
+        3. **Regra de "mais recente" e da coluna 'unique'**
+           - A chave de cada registro é Purchasing Document + Item.
+           - Se essa chave aparecer mais de uma vez no lote (no mesmo arquivo ou em
+             arquivos diferentes), só UMA linha sobrevive: a que tiver a 'Document Date'
+             mais recente. Entre uma linha com data e outra sem, vence a que tem data.
+             Em caso de empate total, vence a última processada.
+           - Por isso, a coluna `unique` (Purchasing Document + Item) nunca se repete
+             no arquivo final — cada valor aparece no máximo uma vez.
+           - O arquivo final sai sempre ordenado do menor para o maior valor de `unique`.
+
+        4. **Ordem das colunas no arquivo final (FIXA, baseada no arquivo de exemplo)**
            - O arquivo final sempre segue a mesma ordem de colunas, independente
              da ordem em que elas apareçam nos arquivos enviados.
-           - Se um nome de coluna aparecia repetido no exemplo (com o mesmo
-             significado), ele entra apenas UMA vez no arquivo final.
            - Se algum arquivo do lote não tiver uma dessas colunas, ela ainda
              aparece no resultado — só que em branco para as linhas daquele arquivo.
            - Se algum arquivo tiver uma coluna com nome diferente de tudo que está
              na ordem padrão, ela é preservada e posicionada **depois** da
-             coluna `unique`, no final de tudo — nunca antes e nunca quebrando a
-             ordem fixa das demais colunas.
+             coluna `unique`, no final de tudo.
 
-        4. **Visualização**
+        5. **Visualização**
            - Acesse a aba "Visualização de Dados"
            - Veja as métricas gerais e uma prévia das primeiras {PREVIEW_ROWS} linhas
 
-        5. **Diagnóstico**
+        6. **Diagnóstico**
            - Sempre que algo não sair 100% como esperado, confira essa aba antes de
              qualquer outra coisa — ela mostra exatamente qual arquivo, em qual etapa,
-             e qual foi o erro ou aviso (inclusive avisos sobre colunas extras
-             encontradas fora da ordem padrão).
+             e qual foi o erro ou aviso.
 
         ### Estrutura esperada da planilha (por arquivo)
         - Cabeçalho **exatamente na linha 1** (sem título, logo ou linhas em branco acima) —
@@ -1225,6 +1258,8 @@ def main():
         - Nenhuma célula mesclada na linha de cabeçalho
         - Colunas obrigatórias presentes, com esses nomes exatos:
           `Purchasing Document`, `Item`, `Order Quantity`, `Net order value`
+        - Coluna `Document Date` presente e preenchida, para que a regra de
+          "mantém o mais recente" funcione corretamente entre arquivos
         - Formato real `.xlsx` (não `.xls` antigo renomeado, não HTML/SYLK exportado
           do SAP com a extensão trocada, e sem senha/proteção)
         - Colunas de data no formato de data do Excel ou texto reconhecível
@@ -1244,20 +1279,25 @@ def main():
              topo deste arquivo). Se o uploader mostrar "Limit 200MB per file", o
              config.toml não está sendo aplicado nesta sessão.
 
-        3. **O que acontece se faltar uma coluna obrigatória em um dos arquivos?**
+        3. **O que acontece se o mesmo Purchasing Document + Item aparecer em dois arquivos?**
+           - Só um sobrevive: o que tiver a 'Document Date' mais recente. O outro é
+             descartado silenciosamente do resultado (isso não é um erro, é o
+             comportamento esperado da deduplicação).
+
+        4. **O que acontece se faltar uma coluna obrigatória em um dos arquivos?**
            - O arquivo ainda é processado, mas os valores derivados dessa coluna saem
              zerados/vazios para ele, e um aviso aparece na aba Diagnóstico.
 
-        4. **E se um arquivo estiver corrompido ou protegido por senha?**
+        5. **E se um arquivo estiver corrompido ou protegido por senha?**
            - Esse arquivo específico é excluído do resultado (não trava o lote inteiro),
              e o motivo exato aparece na aba Diagnóstico.
 
-        5. **E se um arquivo tiver uma coluna com nome que não existe nos outros?**
+        6. **E se um arquivo tiver uma coluna com nome que não existe nos outros?**
            - Ela é preservada no arquivo final, posicionada logo DEPOIS da coluna
              `unique` (no final de tudo). Um aviso é registrado na aba Diagnóstico
              listando quais colunas extras foram encontradas.
 
-        6. **Dados processados são salvos?**
+        7. **Dados processados são salvos?**
            - O arquivo final fica em um arquivo temporário no servidor durante a sessão
              e é removido ao clicar em "Limpar e Voltar ao Início" (ou ao reiniciar a sessão).
         """)
@@ -1276,7 +1316,7 @@ if __name__ == "__main__":
     st.markdown(
         """
         <div style='text-align: center'>
-            <p>Desenvolvido com ❤️ | PO Processor Pro v3.0 (ordem fixa baseada no exemplo)</p>
+            <p>Desenvolvido com ❤️ | PO Processor Pro v4.0 (dedup por mais recente + saída ordenada)</p>
         </div>
         """,
         unsafe_allow_html=True
